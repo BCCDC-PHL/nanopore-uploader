@@ -1,0 +1,21 @@
+{
+    "sequencers": [
+        {
+            "instrument_id": "",
+            "run_output_dir": "",
+            "instrument_type": "gridion",
+            "destination_servers": [
+                {
+                    "server_id": "analysis-cluster",
+                    "server_address": "analysis.example.org",
+                    "login_id": "user",
+                    "id_file": "/home/user/.ssh/id_rsa",
+                    "destination_dir": "/data/sequence/gridion/runs"
+                }
+            ]
+        }
+    ],
+    "scan_interval_seconds": 5,
+    "database_connection_uri": "sqlite:///nanopore_uploader.db",
+    "database_backups_dir": ""
+}
