@@ -48,6 +48,7 @@ def main():
                     logging.error(json.dumps({"event_type": "load_config_failed", "config_file": os.path.abspath(args.config)}))
 
             scan_start_timestamp = datetime.datetime.now()
+            core.find_remote_runs(config)
             for run in core.scan(config):
                 if run is not None:
                     try:

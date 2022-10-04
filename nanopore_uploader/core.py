@@ -1,21 +1,27 @@
 import logging
 import glob
+import io
 import json
 import os
 import re
+
+import paramiko
 
 from typing import Iterator, Optional
 
 import nanopore_uploader.db as db
 
 
-def find_runs(config):
-    gridion_run_id_regex = "\d{8}_\d{4}_X[1-5]_[A-Z0-9]+_[a-f0-9]{8}"
+GRIDION_RUN_ID_REGEX = "\d{8}_\d{4}_X[1-5]_[A-Z0-9]+_[a-f0-9]{8}"
+
+def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
+    """
+    """
     runs = []
     for sequencer in config['sequencers']:
         candidate_run_dirs = glob.glob(os.path.abspath(os.path.join(sequencer['run_output_dir'], '*', '*', '*')))
         for candidate_run_dir in candidate_run_dirs:
-            matches_gridion_run_id_regex = re.match(gridion_run_id_regex, os.path.basename(candidate_run_dir))
+            matches_gridion_run_id_regex = re.match(GRIDION_RUN_ID_REGEX, os.path.basename(candidate_run_dir))
 
             final_summary_files = glob.glob(os.path.abspath(os.path.join(candidate_run_dir, 'final_summary*.txt')))
             if len(final_summary_files) > 0:
@@ -43,6 +49,51 @@ def find_runs(config):
                 runs.append(run)
 
     return runs
+
+
+def find_remote_runs(config: dict[str, object]):
+    
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy( paramiko.AutoAddPolicy() )
+    remote_runs = []
+    for sequencer in config['sequencers']:
+        for destination_server in sequencer['destination_servers']:
+            rsa_key = paramiko.RSAKey.from_private_key_file(destination_server['identity_file'])
+            server_address = destination_server['server_address']
+            username = destination_server['username']
+            destination_dir = destination_server['destination_dir']
+            ssh.connect(server_address, username=username, pkey=rsa_key)
+            list_run_dirs_cmd = [
+                'ls',
+                '-1d',
+                os.path.join(destination_dir, '*')
+            ]
+            stdin, stdout, stderr = ssh.exec_command(' '.join(list_run_dirs_cmd))
+            candidate_remote_run_dirs = [x.strip() for x in stdout.readlines()]
+            print(json.dumps(candidate_remote_run_dirs, indent=2))
+            for candidate_remote_run_dir in candidate_remote_run_dirs:
+                candidate_run_id = os.path.basename(candidate_remote_run_dir)
+                if re.match(GRIDION_RUN_ID_REGEX, candidate_run_id):
+                    list_upload_complete_file_cmd = [
+                        'ls',
+                        '-1d',
+                        os.path.join(candidate_remote_run_dir, 'upload_complete.json')
+                    ]
+                    stdin, stdout, stderr = ssh.exec_command(' '.join(list_upload_complete_file_cmd))
+                    if len(stdout.readlines()) > 0:
+                        upload_status = "UPLOAD_COMPLETE"
+                    else:
+                        upload_status = "UPLOAD_INCOMPLETE"
+                    remote_run = {
+                        'sequencing_run_id': candidate_run_id,
+                        'run_directory': candidate_remote_run_dir,
+                        'status' : upload_status
+                    }
+                    remote_runs.append(remote_run)
+            print(json.dumps(remote_runs, indent=2))
+            exit()
+            
+                
 
 
 def scan(config: dict[str, object]) -> Iterator[Optional[dict[str, object]]]:

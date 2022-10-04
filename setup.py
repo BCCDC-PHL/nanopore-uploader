@@ -15,6 +15,7 @@ setup(
     install_requires=[
         "sqlalchemy==1.4.40",
         "alembic==1.8.0",
+        "paramiko==2.11.0",
     ],
     setup_requires=[],
     tests_require=[],
