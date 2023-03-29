@@ -37,6 +37,11 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
             final_summary_files = glob.glob(os.path.abspath(os.path.join(candidate_run_dir, 'final_summary*.txt')))
             if len(final_summary_files) > 0:
                 final_summary_file = final_summary_files[0]
+                final_summary = {}
+                with open(final_summary_file, 'r') as f:
+                    for line in f:
+                        k, v = line.strip().split('=', 1)
+                        final_summary[k] = v
             else:
                 final_summary_file = None
 
@@ -51,12 +56,16 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
                 run_id = os.path.basename(candidate_run_dir)
                 instrument_type = sequencer.get('instrument_type', None).upper()
                 instrument_id = sequencer.get('instrument_id', None)
+                protocol_group_id = final_summary.get('protocol_group_id', None)
+
                 run = {
                     "sequencing_run_id": run_id,
+                    "protocol_group_id": protocol_group_id,
                     "instrument_type": instrument_type,
                     "instrument_id": instrument_id,
                     "run_directory": candidate_run_dir,
                 }
+
                 runs.append(run)
 
     return runs
@@ -174,14 +183,26 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 ])
             ]
 
+            upload_percent_complete = 0.0
             try:
-                logging.debug(json.dumps({"event_type": "print_upload_command", "sequencing_run_id": run['sequencing_run_id'], "upload_command": upload_command}))
                 rsync_process = subprocess.Popen(' '.join(upload_command), universal_newlines=True, stdout=subprocess.PIPE, text=True, shell=True)
+
                 while (line := rsync_process.stdout.readline()) != "":
                     line = line.strip().split()
                     if len(line) > 1:
-                        percent_complete = float(line[1].removesuffix('%'))
-                        logging.info(json.dumps({"event_type": "upload_progress_update", "sequencing_run_id": run['sequencing_run_id'], "percent_complete": percent_complete}))
+                        upload_percent_complete = float(line[1].removesuffix('%'))
+                        db.update_run_upload_percent_complete_by_id(config, run['sequencing_run_id'], upload_percent_complete)
+                        logging.info(json.dumps({
+                            "event_type": "upload_progress_update", \
+                            "sequencing_run_id": run['sequencing_run_id'],
+                            "percent_complete": upload_percent_complete
+                        }))
+                # Sometimes the last update from rsync is at ~99% complete.
+                # If the last update is >95%, bump it up to 100% complete
+                # This should only happen when the rsync process completes normally.
+                # We shouldn't bump up the percent complete if the upload didn't actually complete.
+                if upload_percent_complete > 95.0:
+                    db.update_run_upload_percent_complete_by_id(config, run['sequencing_run_id'], 100.0)
             except subprocess.CalledProcessError as e:
                 logging.error(json.dumps({"event_type": "error_during_upload", "sequencing_run_id": run['sequencing_run_id']}))
                 # TODO: Further error handling.

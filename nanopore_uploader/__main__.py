@@ -32,6 +32,7 @@ def main():
         level=log_level,
     )
     logging.debug(json.dumps({"event_type": "debug_logging_enabled"}))
+    logging.getLogger("paramiko").setLevel(logging.ERROR)
 
     quit_when_safe = False
     scan_interval = DEFAULT_SCAN_INTERVAL_SECONDS

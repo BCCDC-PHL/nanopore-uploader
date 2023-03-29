@@ -18,10 +18,13 @@ Base = declarative_base()
 class SequencingRun(Base):
     __tablename__ = 'sequencing_run'
 
-    sequencing_run_id = Column(String, primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sequencing_run_id = Column(String)
+    protocol_group_id = Column(String)
     instrument_type = Column(String)
     instrument_id = Column(String)
     run_date = Column(Date)
     run_directory = Column(String)
     status = Column(String)
+    upload_percent_complete = Column(Float, default=0.0)
     timestamp_updated = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
