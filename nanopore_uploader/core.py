@@ -4,6 +4,8 @@ import io
 import json
 import os
 import re
+import subprocess
+import time
 
 import paramiko
 
@@ -13,15 +15,24 @@ import nanopore_uploader.db as db
 
 
 GRIDION_RUN_ID_REGEX = "\d{8}_\d{4}_X[1-5]_[A-Z0-9]+_[a-f0-9]{8}"
+PROMETHION_RUN_ID_REGEX = "\d{8}_\d{4}_P2S_[0-9\-]+_[A-Z0-9]+_[a-f0-9]{8}"
 
 def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
     """
+    Look through sub-directories of each sequencer's run output directory. Find directories that match
+    the run ID format, and are complete (as indicated by the presence of a `final_summary` file.
+    
+    :param config: Application config
+    :type config: dict[str, object]
+    :return: List of keys: `["sequencing_run_id", "instrument_type", "instrument_id", "run_directory"]`
+    :rtype: list[dict[str, str]]
     """
     runs = []
     for sequencer in config['sequencers']:
         candidate_run_dirs = glob.glob(os.path.abspath(os.path.join(sequencer['run_output_dir'], '*', '*', '*')))
         for candidate_run_dir in candidate_run_dirs:
             matches_gridion_run_id_regex = re.match(GRIDION_RUN_ID_REGEX, os.path.basename(candidate_run_dir))
+            matches_promethion_run_id_regex = re.match(PROMETHION_RUN_ID_REGEX, os.path.basename(candidate_run_dir))
 
             final_summary_files = glob.glob(os.path.abspath(os.path.join(candidate_run_dir, 'final_summary*.txt')))
             if len(final_summary_files) > 0:
@@ -31,7 +42,7 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
 
             conditions_checked = {
                 "is_directory": os.path.isdir(candidate_run_dir),
-                "matches_gridion_run_id_regex": matches_gridion_run_id_regex is not None,
+                "matches_run_id_regex": matches_gridion_run_id_regex or matches_promethion_run_id_regex,
                 "run_complete": final_summary_file is not None and os.path.exists(final_summary_file),
             }
 
@@ -51,8 +62,15 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
     return runs
 
 
-def find_remote_runs(config: dict[str, object]):
-    
+def find_remote_runs(config: dict[str, object]) -> list[dict[str, object]]:
+    """
+    Check the remote destination server to see which runs have already been uploaded.
+
+    :param config: Application config.
+    :type config: dict[str, object]
+    :return: List of runs on the remote destination servers. Keys: `["sequencing_run_id", "run_directory", "status"]
+    :rtype: list[dict[stry, object]]
+    """
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy( paramiko.AutoAddPolicy() )
     remote_runs = []
@@ -70,7 +88,7 @@ def find_remote_runs(config: dict[str, object]):
             ]
             stdin, stdout, stderr = ssh.exec_command(' '.join(list_run_dirs_cmd))
             candidate_remote_run_dirs = [x.strip() for x in stdout.readlines()]
-            print(json.dumps(candidate_remote_run_dirs, indent=2))
+
             for candidate_remote_run_dir in candidate_remote_run_dirs:
                 candidate_run_id = os.path.basename(candidate_remote_run_dir)
                 if re.match(GRIDION_RUN_ID_REGEX, candidate_run_id):
@@ -90,10 +108,8 @@ def find_remote_runs(config: dict[str, object]):
                         'status' : upload_status
                     }
                     remote_runs.append(remote_run)
-            print(json.dumps(remote_runs, indent=2))
-            exit()
-            
-                
+
+    return remote_runs
 
 
 def scan(config: dict[str, object]) -> Iterator[Optional[dict[str, object]]]:
@@ -106,6 +122,13 @@ def scan(config: dict[str, object]) -> Iterator[Optional[dict[str, object]]]:
 
 def check_run_status(config: dict[str, object], run: dict[str, object]):
     """
+    
+    :param config: Application config.
+    :type config: dict[str, object]
+    :param run: Sequencing run.
+    :type run: dict[str, object]
+    :return: Run status
+    :rtype: str
     """
     existing_run = db.get_run_by_id(config, run['sequencing_run_id'])
     if existing_run is not None:
@@ -120,13 +143,48 @@ def check_run_status(config: dict[str, object], run: dict[str, object]):
 
 
 def upload_run(config: dict[str, object], run: dict[str, object]):
+    """
+    Upload a run to each destination server.
+
+    :param config: Application config.
+    :type config: dict[str, object]
+    :param run: Sequencing run
+    :type run: dict[str, object]
+    :return: None
+    :rtype: None
+    """
     db.update_run_status_by_id(config, run['sequencing_run_id'], 'UPLOAD_STARTED')
-    
-    upload_command = [
-        'rsync',
-        '-artvh',
-        '-p',
-        '-e', 'ssh',
-    ]
+    logging.info(json.dumps({"event_type": "upload_started", "sequencing_run_id": run['sequencing_run_id']}))
+    for sequencer in config['sequencers']:
+        for destination_server in sequencer['destination_servers']:
+            upload_command = [
+                'rsync',
+                '-arth',
+                '--info=progress2',
+                '--no-inc-recursive',
+                '-e', '"ssh -i ' + destination_server['identity_file'] + '"',
+                '='.join(['--chmod', '"' + destination_server['permissions'] + '"']),
+                run['run_directory'],
+                ''.join([
+                    destination_server['username'],
+                    '@',
+                    destination_server['server_address'],
+                    ':',
+                    destination_server['destination_dir'],
+                ])
+            ]
+
+            try:
+                logging.debug(json.dumps({"event_type": "print_upload_command", "sequencing_run_id": run['sequencing_run_id'], "upload_command": upload_command}))
+                rsync_process = subprocess.Popen(' '.join(upload_command), universal_newlines=True, stdout=subprocess.PIPE, text=True, shell=True)
+                while (line := rsync_process.stdout.readline()) != "":
+                    line = line.strip().split()
+                    if len(line) > 1:
+                        percent_complete = float(line[1].removesuffix('%'))
+                        logging.info(json.dumps({"event_type": "upload_progress_update", "sequencing_run_id": run['sequencing_run_id'], "percent_complete": percent_complete}))
+            except subprocess.CalledProcessError as e:
+                logging.error(json.dumps({"event_type": "error_during_upload", "sequencing_run_id": run['sequencing_run_id']}))
+                # TODO: Further error handling.
 
     db.update_run_status_by_id(config, run['sequencing_run_id'], 'UPLOAD_COMPLETE')
+    logging.info(json.dumps({"event_type": "upload_complete", "sequencing_run_id": run['sequencing_run_id']}))
