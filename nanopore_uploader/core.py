@@ -1,7 +1,8 @@
-import logging
+import datetime
 import glob
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -164,8 +165,9 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
     :return: None
     :rtype: None
     """
-    db.update_run_status_by_id(config, run['sequencing_run_id'], 'UPLOAD_STARTED')
-    logging.info(json.dumps({"event_type": "upload_started", "sequencing_run_id": run['sequencing_run_id']}))
+    run_id = run['sequencing_run_id']
+    db.update_run_status_by_id(config, run_id, 'UPLOAD_STARTED')
+    logging.info(json.dumps({"event_type": "upload_started", "sequencing_run_id": run_id}))
     for sequencer in config['sequencers']:
         if 'excluded_run_contents' in sequencer:
             excluded_run_contents = list(map(lambda x: '--exclude ' + x, sequencer['excluded_run_contents']))
@@ -192,10 +194,12 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
 
             logging.debug(json.dumps({
                 "event_type": "upload_command_generated", \
-                "sequencing_run_id": run['sequencing_run_id'],
+                "sequencing_run_id": run_id,
                 "upload_command": upload_command
             }))
+
             upload_percent_complete = 0.0
+            timestamp_upload_start = datetime.datetime.now().isoformat()
             try:
                 rsync_process = subprocess.Popen(' '.join(upload_command), universal_newlines=True, stdout=subprocess.PIPE, text=True, shell=True)
 
@@ -203,20 +207,61 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                     line = line.strip().split()
                     if len(line) > 1:
                         upload_percent_complete = float(line[1].removesuffix('%'))
-                        db.update_run_upload_percent_complete_by_id(config, run['sequencing_run_id'], upload_percent_complete)
+                        db.update_run_upload_percent_complete_by_id(config, run_id, upload_percent_complete)
                         logging.info(json.dumps({
                             "event_type": "upload_progress_update", \
-                            "sequencing_run_id": run['sequencing_run_id'],
+                            "sequencing_run_id": run_id,
                             "percent_complete": upload_percent_complete
                         }))
+
+                rsync_returncode = rsync_process.wait()
+                timestamp_upload_complete = datetime.datetime.now().isoformat()
+                logging.debug(json.dumps({
+                    "event_type": "rsync_returncode_captured",
+                    "sequencing_run_id": run_id,
+                    "rsync_returncode": rsync_returncode
+                }))
+
+                # Write an 'upload_complete.json' file on the remote system to indicate
+                # to downstream automation systems that the upload is complete and the run
+                # is ready for further processing
+                if rsync_returncode == 0:
+                    upload_complete = {
+                        "timestamp_upload_start": timestamp_upload_start,
+                        "timestamp_upload_complete": timestamp_upload_complete,
+                    }
+                    ssh = paramiko.SSHClient()
+                    ssh.set_missing_host_key_policy( paramiko.AutoAddPolicy() )
+                    rsa_key = paramiko.RSAKey.from_private_key_file(destination_server['identity_file'])
+                    server_address = destination_server['server_address']
+                    username = destination_server['username']
+                    destination_dir = destination_server['destination_dir']
+                    ssh.connect(server_address, username=username, pkey=rsa_key)
+                    ftp = ssh.open_sftp()
+                    upload_complete_destination_path = os.path.join(destination_server['destination_dir'], run_id, 'upload_complete.json')
+                    upload_complete_file_contents = json.dumps(upload_complete, indent=2) + '\n'
+                    ftp.putfo(io.BytesIO(upload_complete_file_contents.encode()), upload_complete_destination_path)
+                    ftp.close()
+                    ssh.close()
+                    logging.info(json.dumps({
+                        "event_type": "upload_complete_file_written",
+                        "sequencing_run_id": run_id,
+                        "upload_complete_destination_path": upload_complete_destination_path,
+                    }))
+                    
+
                 # Sometimes the last update from rsync is at ~99% complete.
                 # If the last update is >95%, bump it up to 100% complete
                 # This should only happen when the rsync process completes normally.
                 # We shouldn't bump up the percent complete if the upload didn't actually complete.
-                if upload_percent_complete > 95.0:
-                    db.update_run_upload_percent_complete_by_id(config, run['sequencing_run_id'], 100.0)
+                if upload_percent_complete > 95.0 and rsync_returncode == 0:
+                    db.update_run_upload_percent_complete_by_id(config, run_id, 100.0)
+            except KeyboardInterrupt as e:
+                db.update_run_status_by_id(config, run_id, 'UPLOAD_INCOMPLETE')
+                raise e
             except subprocess.CalledProcessError as e:
-                logging.error(json.dumps({"event_type": "error_during_upload", "sequencing_run_id": run['sequencing_run_id']}))
+                logging.error(json.dumps({"event_type": "error_during_upload", "sequencing_run_id": run_id}))
+                db.update_run_status_by_id(config, run_id, 'UPLOAD_INCOMPLETE_WITH_ERROR')
                 # TODO: Further error handling.
 
     db.update_run_status_by_id(config, run['sequencing_run_id'], 'UPLOAD_COMPLETE')

@@ -26,5 +26,7 @@ class SequencingRun(Base):
     run_date = Column(Date)
     run_directory = Column(String)
     status = Column(String)
+    timestamp_upload_start = Column(String)
+    timestamp_upload_complete = Column(String)
     upload_percent_complete = Column(Float, default=0.0)
     timestamp_updated = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
