@@ -59,6 +59,8 @@ def get_run_by_id(config: dict[str, object], run_id: str):
     else:
         run = None
 
+    session.close()
+
     return run
 
 
@@ -77,6 +79,8 @@ def update_run_status_by_id(config: dict[str, object], run_id: str, status: str)
         session.add(existing_run)
         session.commit()
 
+    session.close()
+
 
 def update_run_upload_percent_complete_by_id(config: dict[str, object], run_id: str, upload_percent_complete: float):
     """
@@ -91,3 +95,5 @@ def update_run_upload_percent_complete_by_id(config: dict[str, object], run_id: 
     if existing_run is not None:
         existing_run.upload_percent_complete = upload_percent_complete
         session.commit()
+
+    session.close()

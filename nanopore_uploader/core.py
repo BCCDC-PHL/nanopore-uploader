@@ -29,10 +29,11 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
     """
     runs = []
     for sequencer in config['sequencers']:
-        candidate_run_dirs = glob.glob(os.path.abspath(os.path.join(sequencer['run_output_dir'], '*', '*', '*')))
+        candidate_run_dirs = glob.glob(os.path.abspath(os.path.join(sequencer['instrument_output_dir'], '*', '*', '*')))
         for candidate_run_dir in candidate_run_dirs:
-            matches_gridion_run_id_regex = re.match(GRIDION_RUN_ID_REGEX, os.path.basename(candidate_run_dir))
-            matches_promethion_run_id_regex = re.match(PROMETHION_RUN_ID_REGEX, os.path.basename(candidate_run_dir))
+            run_id = os.path.basename(candidate_run_dir)
+            matches_gridion_run_id_regex = re.match(GRIDION_RUN_ID_REGEX, run_id)
+            matches_promethion_run_id_regex = re.match(PROMETHION_RUN_ID_REGEX, run_id)
 
             final_summary_files = glob.glob(os.path.abspath(os.path.join(candidate_run_dir, 'final_summary*.txt')))
             if len(final_summary_files) > 0:
@@ -49,6 +50,7 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
                 "is_directory": os.path.isdir(candidate_run_dir),
                 "matches_run_id_regex": matches_gridion_run_id_regex or matches_promethion_run_id_regex,
                 "run_complete": final_summary_file is not None and os.path.exists(final_summary_file),
+                "not_excluded": run_id not in config['excluded_runs'],
             }
 
             conditions_met = list(conditions_checked.values())
@@ -165,6 +167,10 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
     db.update_run_status_by_id(config, run['sequencing_run_id'], 'UPLOAD_STARTED')
     logging.info(json.dumps({"event_type": "upload_started", "sequencing_run_id": run['sequencing_run_id']}))
     for sequencer in config['sequencers']:
+        if 'excluded_run_contents' in sequencer:
+            excluded_run_contents = list(map(lambda x: '--exclude ' + x, sequencer['excluded_run_contents']))
+        else:
+            excluded_run_contents = []
         for destination_server in sequencer['destination_servers']:
             upload_command = [
                 'rsync',
@@ -173,6 +179,7 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 '--no-inc-recursive',
                 '-e', '"ssh -i ' + destination_server['identity_file'] + '"',
                 '='.join(['--chmod', '"' + destination_server['permissions'] + '"']),
+                ' '.join(excluded_run_contents),
                 run['run_directory'],
                 ''.join([
                     destination_server['username'],
@@ -183,6 +190,11 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 ])
             ]
 
+            logging.debug(json.dumps({
+                "event_type": "upload_command_generated", \
+                "sequencing_run_id": run['sequencing_run_id'],
+                "upload_command": upload_command
+            }))
             upload_percent_complete = 0.0
             try:
                 rsync_process = subprocess.Popen(' '.join(upload_command), universal_newlines=True, stdout=subprocess.PIPE, text=True, shell=True)
