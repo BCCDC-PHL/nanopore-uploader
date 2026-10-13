@@ -1,11 +1,9 @@
 
 from setuptools import setup, find_packages
 
-import nanopore_uploader
-
 setup(
     name='nanopore-uploader',
-    version=nanopore_uploader.__version__,
+    version='0.1.0',
     description='',
     author='Dan Fornika',
     author_email='dan.fornika@bccdc.ca',
@@ -13,9 +11,9 @@ setup(
     packages=find_packages(exclude=('test', 'test.*')),
     python_requires='>=3.10',
     install_requires=[
-        "sqlalchemy==1.4.40",
-        "alembic==1.8.0",
-        "paramiko==2.11.0",
+        "paramiko~=2.11.0",
+        "requests~=2.32",
+        "jinja2~=3.1",
     ],
     setup_requires=[],
     tests_require=[],

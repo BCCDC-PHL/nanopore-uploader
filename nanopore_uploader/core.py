@@ -14,9 +14,10 @@ from typing import Iterator, Optional
 
 import nanopore_uploader.db as db
 
+log = logging.getLogger(__name__)
 
-GRIDION_RUN_ID_REGEX = "\d{8}_\d{4}_X[1-5]_[A-Z0-9]+_[a-f0-9]{8}"
-PROMETHION_RUN_ID_REGEX = "\d{8}_\d{4}_P2S_[0-9\-]+_[A-Z0-9]+_[a-f0-9]{8}"
+GRIDION_RUN_ID_REGEX = r"\d{8}_\d{4}_X[1-5]_[A-Z0-9]+_[a-f0-9]{8}"
+PROMETHION_RUN_ID_REGEX = r"\d{8}_\d{4}_P2S_[0-9\-]+_[A-Z0-9]+_[a-f0-9]{8}"
 
 def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
     """
@@ -127,9 +128,8 @@ def find_remote_runs(config: dict[str, object]) -> list[dict[str, object]]:
 def scan(config: dict[str, object]) -> Iterator[Optional[dict[str, object]]]:
     """
     """
-    logging.info(json.dumps({"event_type": "scan_start"}))
-    for run in find_runs(config):
-        yield run
+    log.info({"event_type": "scan_start"})
+    yield from find_runs(config)
 
 
 def check_run_status(config: dict[str, object], run: dict[str, object]):
@@ -167,7 +167,7 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
     """
     run_id = run['sequencing_run_id']
     db.update_run_status_by_id(config, run_id, 'UPLOAD_STARTED')
-    logging.info(json.dumps({"event_type": "upload_started", "sequencing_run_id": run_id}))
+    log.info({"event_type": "upload_started", "sequencing_run_id": run_id})
     for sequencer in config['sequencers']:
         if 'excluded_run_contents' in sequencer:
             excluded_run_contents = list(map(lambda x: '--exclude ' + x, sequencer['excluded_run_contents']))
@@ -192,11 +192,11 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 ])
             ]
 
-            logging.debug(json.dumps({
+            logging.debug({
                 "event_type": "upload_command_generated", \
                 "sequencing_run_id": run_id,
                 "upload_command": upload_command
-            }))
+            })
 
             upload_percent_complete = 0.0
             timestamp_upload_start = datetime.datetime.now().isoformat()
@@ -208,19 +208,19 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                     if len(line) > 1:
                         upload_percent_complete = float(line[1].removesuffix('%'))
                         db.update_run_upload_percent_complete_by_id(config, run_id, upload_percent_complete)
-                        logging.info(json.dumps({
+                        log.info({
                             "event_type": "upload_progress_update", \
                             "sequencing_run_id": run_id,
                             "percent_complete": upload_percent_complete
-                        }))
+                        })
 
                 rsync_returncode = rsync_process.wait()
                 timestamp_upload_complete = datetime.datetime.now().isoformat()
-                logging.debug(json.dumps({
+                log.debug({
                     "event_type": "rsync_returncode_captured",
                     "sequencing_run_id": run_id,
                     "rsync_returncode": rsync_returncode
-                }))
+                })
 
                 # Write an 'upload_complete.json' file on the remote system to indicate
                 # to downstream automation systems that the upload is complete and the run
@@ -260,9 +260,9 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 db.update_run_status_by_id(config, run_id, 'UPLOAD_INCOMPLETE')
                 raise e
             except subprocess.CalledProcessError as e:
-                logging.error(json.dumps({"event_type": "error_during_upload", "sequencing_run_id": run_id}))
+                log.error({"event_type": "error_during_upload", "sequencing_run_id": run_id})
                 db.update_run_status_by_id(config, run_id, 'UPLOAD_INCOMPLETE_WITH_ERROR')
                 # TODO: Further error handling.
 
     db.update_run_status_by_id(config, run['sequencing_run_id'], 'UPLOAD_COMPLETE')
-    logging.info(json.dumps({"event_type": "upload_complete", "sequencing_run_id": run['sequencing_run_id']}))
+    log.info({"event_type": "upload_complete", "sequencing_run_id": run['sequencing_run_id']})
