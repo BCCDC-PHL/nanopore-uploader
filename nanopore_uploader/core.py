@@ -3,6 +3,7 @@ import glob
 import io
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -220,7 +221,7 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 '-arth',
                 '--info=progress2',
                 '--no-inc-recursive',
-                '-e', '"ssh -i ' + destination_server['id_file'] + '"',
+                # '-e', '"ssh -i ' + destination_server['id_file'] + '"',
                 permissions_string,
                 str(Path(run['run_directory'])),
                 ''.join([
@@ -242,18 +243,35 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
             upload_percent_complete = 0.0
             timestamp_upload_start = datetime.datetime.now().isoformat()
             try:
-                rsync_process = subprocess.run(upload_command)
-                for line in []:
-                    # for line in rsync_process.stdout.splitlines():
-                    line = line.strip().split()
-                    if len(line) > 1:
-                        upload_percent_complete = float(line[1].removesuffix('%'))
-                        db.update_run_upload_percent_complete_by_id(config, run_id, upload_percent_complete)
-                        log.info({
-                            "event_type": "upload_progress_update", \
-                            "sequencing_run_id": run_id,
-                            "percent_complete": upload_percent_complete
-                        })
+                rsync_process = subprocess.Popen(
+                    upload_command_list,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1
+                )
+                next_milestone = 10.0
+                while True:
+                    line = rsync_process.stdout.readline()
+                    if not line and rsync_process.poll() is not None:
+                        break
+                    if line:
+                        split_line = line.strip().split()
+                        if len(split_line) > 1:
+                            data_transferred = split_line[0]
+                            upload_percent_complete = float(split_line[1].removesuffix('%'))
+                            upload_speed = split_line[2]
+                            upload_duration = split_line[3]
+                            if upload_percent_complete >= next_milestone:
+                                log.info({
+                                    "event_type": "upload_progress_update",
+                                    "sequencing_run_id": run_id,
+                                    "data_transferred": data_transferred,
+                                    "percent_complete": upload_percent_complete,
+                                    "upload_speed": upload_speed,
+                                    "upload_duration": upload_duration,
+                                })
+                                next_milestone = (math.floor(upload_percent_complete / 5) + 1) * 5
 
                 rsync_returncode = rsync_process.returncode
                 timestamp_upload_complete = datetime.datetime.now().isoformat()
