@@ -47,15 +47,15 @@ class UploadStatus(StrEnum):
 
 
 @dataclass
-class SequencingRun(Base):
+class SequencingRun():
     sequencing_run_id: str
     protocol_group_id: str
     instrument_type: InstrumentType
     instrument_id: str
     run_date: datetime.date
-    run_directory = Column(String)
+    run_directory: Path
     status: UploadStatus
-    timestamp_upload_start = Column(String)
-    timestamp_upload_complete = Column(String)
-    upload_percent_complete = Column(Float, default=0.0)
-    timestamp_updated = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
+    timestamp_upload_start: Optional[datetime] = None
+    timestamp_upload_complete: Optional[datetime] = None
+    upload_percent_complete: float = 0.0
+    timestamp_updated: datetime = field(default_factory=datetime.now)

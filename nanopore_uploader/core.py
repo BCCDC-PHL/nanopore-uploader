@@ -7,9 +7,13 @@ import os
 import re
 import subprocess
 import time
+import warnings
 
+from cryptography.utils import CryptographyDeprecationWarning
+warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 import paramiko
 
+from pathlib import Path, PurePosixPath
 from typing import Iterator, Optional
 
 import nanopore_uploader.db as db
@@ -31,13 +35,18 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
     """
     runs = []
     for sequencer in config['sequencers']:
-        candidate_run_dirs = glob.glob(os.path.abspath(os.path.join(sequencer['instrument_output_dir'], '*', '*', '*')))
+        candidate_run_dirs = glob.glob(str(PurePosixPath(sequencer['run_output_dir'], '*', '*')))
+        log.info({
+            "event_type": "candidate_run_dirs_found",
+            "sequencer": sequencer['run_output_dir'],
+            "num_candidate_run_dirs": len(candidate_run_dirs),
+        })
         for candidate_run_dir in candidate_run_dirs:
             run_id = os.path.basename(candidate_run_dir)
             matches_gridion_run_id_regex = re.match(GRIDION_RUN_ID_REGEX, run_id)
             matches_promethion_run_id_regex = re.match(PROMETHION_RUN_ID_REGEX, run_id)
 
-            final_summary_files = glob.glob(os.path.abspath(os.path.join(candidate_run_dir, 'final_summary*.txt')))
+            final_summary_files = glob.glob(str(PurePosixPath(candidate_run_dir, 'final_summary*.txt')))
             if len(final_summary_files) > 0:
                 final_summary_file = final_summary_files[0]
                 final_summary = {}
@@ -54,6 +63,11 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
                 "run_complete": final_summary_file is not None and os.path.exists(final_summary_file),
                 "not_excluded": run_id not in config['excluded_runs'],
             }
+            log.debug({
+                "event_type": "conditions_checked",
+                "sequencing_run_id": run_id,
+                "conditions_checked": conditions_checked
+            })
 
             conditions_met = list(conditions_checked.values())
             if all(conditions_met):
@@ -89,26 +103,33 @@ def find_remote_runs(config: dict[str, object]) -> list[dict[str, object]]:
     remote_runs = []
     for sequencer in config['sequencers']:
         for destination_server in sequencer['destination_servers']:
-            rsa_key = paramiko.RSAKey.from_private_key_file(destination_server['identity_file'])
             server_address = destination_server['server_address']
-            username = destination_server['username']
+            log.info({"event_type": "connecting_to_remote_server", "server_address": server_address})
+            rsa_key = paramiko.RSAKey.from_private_key_file(destination_server['id_file'])
+            username = destination_server['login_id']
             destination_dir = destination_server['destination_dir']
             ssh.connect(server_address, username=username, pkey=rsa_key)
+            log.info({"event_type": "connected_to_remote_server", "server_address": server_address})
             list_run_dirs_cmd = [
                 'ls',
                 '-1d',
-                os.path.join(destination_dir, '*')
+                str(PurePosixPath(destination_dir) / '*'),
             ]
             stdin, stdout, stderr = ssh.exec_command(' '.join(list_run_dirs_cmd))
+            log.debug({"event_type": "executed_remote_command", "command": ' '.join(list_run_dirs_cmd)})
             candidate_remote_run_dirs = [x.strip() for x in stdout.readlines()]
+            log.info({
+                "event_type": "found_remote_run_directories", 
+                "num_candidate_remote_run_dirs": len(candidate_remote_run_dirs)
+            })
 
             for candidate_remote_run_dir in candidate_remote_run_dirs:
                 candidate_run_id = os.path.basename(candidate_remote_run_dir)
-                if re.match(GRIDION_RUN_ID_REGEX, candidate_run_id):
+                if re.match(GRIDION_RUN_ID_REGEX, candidate_run_id) or re.match(PROMETHION_RUN_ID_REGEX, candidate_run_id):
                     list_upload_complete_file_cmd = [
                         'ls',
                         '-1d',
-                        os.path.join(candidate_remote_run_dir, 'upload_complete.json')
+                        str(PurePosixPath(candidate_remote_run_dir) / 'upload_complete.json')
                     ]
                     stdin, stdout, stderr = ssh.exec_command(' '.join(list_upload_complete_file_cmd))
                     if len(stdout.readlines()) > 0:
@@ -122,14 +143,40 @@ def find_remote_runs(config: dict[str, object]) -> list[dict[str, object]]:
                     }
                     remote_runs.append(remote_run)
 
+            log.debug({
+                "event_type": "remote_run_processed",
+                "num_remote_runs": len(remote_runs)
+            })
+
     return remote_runs
 
 
-def scan(config: dict[str, object]) -> Iterator[Optional[dict[str, object]]]:
+def scan(config: dict[str, object], remote_runs: list[dict[str, object]]) -> Iterator[Optional[dict[str, object]]]:
     """
+    Scan for sequencing runs and update their status based on remote runs.
+
+    :param config: Application config.
+    :type config: dict[str, object]
+    :param remote_runs: List of remote runs with their status.
+    :type remote_runs: list[dict[str, object]]
+    :return: Iterator of sequencing runs with updated status.
+    :rtype: Iterator[Optional[dict[str, object]]]
     """
-    log.info({"event_type": "scan_start"})
-    yield from find_runs(config)
+    for run in find_runs(config):
+        log.debug({
+            "event_type": "scanning_run",
+            "sequencing_run_id": run['sequencing_run_id']
+        })
+        for remote_run in remote_runs:
+            if run['sequencing_run_id'] == remote_run['sequencing_run_id']:
+                run['status'] = remote_run['status']
+                log.debug({
+                    "event_type": "remote_run_matched",
+                    "sequencing_run_id": run['sequencing_run_id'],
+                    "status": run['status']
+                })
+                break
+        yield run
 
 
 def check_run_status(config: dict[str, object], run: dict[str, object]):
@@ -179,12 +226,12 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 '-arth',
                 '--info=progress2',
                 '--no-inc-recursive',
-                '-e', '"ssh -i ' + destination_server['identity_file'] + '"',
+                '-e', '"ssh -i ' + destination_server['id_file'] + '"',
                 '='.join(['--chmod', '"' + destination_server['permissions'] + '"']),
                 ' '.join(excluded_run_contents),
                 run['run_directory'],
                 ''.join([
-                    destination_server['username'],
+                    destination_server['login_id'],
                     '@',
                     destination_server['server_address'],
                     ':',
@@ -232,9 +279,9 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                     }
                     ssh = paramiko.SSHClient()
                     ssh.set_missing_host_key_policy( paramiko.AutoAddPolicy() )
-                    rsa_key = paramiko.RSAKey.from_private_key_file(destination_server['identity_file'])
+                    rsa_key = paramiko.RSAKey.from_private_key_file(destination_server['id_file'])
                     server_address = destination_server['server_address']
-                    username = destination_server['username']
+                    username = destination_server['login_id']
                     destination_dir = destination_server['destination_dir']
                     ssh.connect(server_address, username=username, pkey=rsa_key)
                     ftp = ssh.open_sftp()
