@@ -152,5 +152,5 @@ def configure_logging(log_level: str="info", log_file: Optional[os.PathLike]=Non
         level=log_level.upper(),
         handlers=[handler]
     )
-    if log_level.lower() != "debug":
-        logging.getLogger("paramiko").setLevel(logging.ERROR)
+    # if log_level.lower() != "debug":
+    logging.getLogger("paramiko").setLevel(logging.ERROR)

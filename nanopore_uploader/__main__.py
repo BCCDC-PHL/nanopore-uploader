@@ -51,8 +51,8 @@ def main():
     try:
         while(True):
             scan_start_timestamp = datetime.datetime.now()
-            remote_runs = core.find_remote_runs(config)
-            for run in core.scan(config, remote_runs):
+            # remote_runs = core.find_remote_runs(config)
+            for run in core.scan(config):
                 log.info({
                     "event_type": "found_run",
                     "sequencing_run_id": run['sequencing_run_id'],
@@ -64,10 +64,6 @@ def main():
                         "sequencing_run_id": run['sequencing_run_id'],
                     })
                     core.upload_run(config, run)
-                    log.info({
-                        "event_type": "upload_completed",
-                        "sequencing_run_id": run['sequencing_run_id'],
-                    })
                 # A problem with one run shouldn't stop other runs from being checked.
                 # No 'qc_check_complete.json' is written, so the run will be retried on the next scan.
                 except OSError as e:

@@ -35,13 +35,14 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
     """
     runs = []
     for sequencer in config['sequencers']:
-        candidate_run_dirs = glob.glob(str(PurePosixPath(sequencer['run_output_dir'], '*', '*')))
+        candidate_run_dirs = glob.glob(str(PurePosixPath(sequencer['run_output_dir'], '*', '*', '*')))
         log.info({
             "event_type": "candidate_run_dirs_found",
             "sequencer": sequencer['run_output_dir'],
             "num_candidate_run_dirs": len(candidate_run_dirs),
         })
         for candidate_run_dir in candidate_run_dirs:
+            candidate_run_dir = os.path.abspath(PurePosixPath(candidate_run_dir))
             run_id = os.path.basename(candidate_run_dir)
             matches_gridion_run_id_regex = re.match(GRIDION_RUN_ID_REGEX, run_id)
             matches_promethion_run_id_regex = re.match(PROMETHION_RUN_ID_REGEX, run_id)
@@ -61,7 +62,6 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
                 "is_directory": os.path.isdir(candidate_run_dir),
                 "matches_run_id_regex": matches_gridion_run_id_regex or matches_promethion_run_id_regex,
                 "run_complete": final_summary_file is not None and os.path.exists(final_summary_file),
-                "not_excluded": run_id not in config['excluded_runs'],
             }
             log.debug({
                 "event_type": "conditions_checked",
@@ -132,6 +132,7 @@ def find_remote_runs(config: dict[str, object]) -> list[dict[str, object]]:
                         str(PurePosixPath(candidate_remote_run_dir) / 'upload_complete.json')
                     ]
                     stdin, stdout, stderr = ssh.exec_command(' '.join(list_upload_complete_file_cmd))
+                    log.debug({"event_type": "executed_remote_command", "command": ' '.join(list_upload_complete_file_cmd)})
                     if len(stdout.readlines()) > 0:
                         upload_status = "UPLOAD_COMPLETE"
                     else:
@@ -143,15 +144,15 @@ def find_remote_runs(config: dict[str, object]) -> list[dict[str, object]]:
                     }
                     remote_runs.append(remote_run)
 
-            log.debug({
-                "event_type": "remote_run_processed",
+            log.info({
+                "event_type": "remote_runs_processed",
                 "num_remote_runs": len(remote_runs)
             })
 
     return remote_runs
 
 
-def scan(config: dict[str, object], remote_runs: list[dict[str, object]]) -> Iterator[Optional[dict[str, object]]]:
+def scan(config: dict[str, object]) -> Iterator[Optional[dict[str, object]]]:
     """
     Scan for sequencing runs and update their status based on remote runs.
 
@@ -163,19 +164,6 @@ def scan(config: dict[str, object], remote_runs: list[dict[str, object]]) -> Ite
     :rtype: Iterator[Optional[dict[str, object]]]
     """
     for run in find_runs(config):
-        log.debug({
-            "event_type": "scanning_run",
-            "sequencing_run_id": run['sequencing_run_id']
-        })
-        for remote_run in remote_runs:
-            if run['sequencing_run_id'] == remote_run['sequencing_run_id']:
-                run['status'] = remote_run['status']
-                log.debug({
-                    "event_type": "remote_run_matched",
-                    "sequencing_run_id": run['sequencing_run_id'],
-                    "status": run['status']
-                })
-                break
         yield run
 
 
@@ -221,15 +209,20 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
         else:
             excluded_run_contents = []
         for destination_server in sequencer['destination_servers']:
-            upload_command = [
+            permissions_strings = []
+            for key, value in destination_server['permissions'].items():
+                permissions_strings.append(key + '=' + value)
+            permissions_string = '--chmod=' + ','.join(permissions_strings)
+            log.debug({"event_type": "permissions_string_generated", "permissions_string": permissions_string})
+
+            upload_command_list = [
                 'rsync',
                 '-arth',
                 '--info=progress2',
                 '--no-inc-recursive',
                 '-e', '"ssh -i ' + destination_server['id_file'] + '"',
-                '='.join(['--chmod', '"' + destination_server['permissions'] + '"']),
-                ' '.join(excluded_run_contents),
-                run['run_directory'],
+                permissions_string,
+                str(Path(run['run_directory'])),
                 ''.join([
                     destination_server['login_id'],
                     '@',
@@ -239,18 +232,19 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 ])
             ]
 
+            upload_command = ' '.join(upload_command_list)
             logging.debug({
-                "event_type": "upload_command_generated", \
+                "event_type": "upload_command_generated",
                 "sequencing_run_id": run_id,
                 "upload_command": upload_command
             })
-
+            
             upload_percent_complete = 0.0
             timestamp_upload_start = datetime.datetime.now().isoformat()
             try:
-                rsync_process = subprocess.Popen(' '.join(upload_command), universal_newlines=True, stdout=subprocess.PIPE, text=True, shell=True)
-
-                while (line := rsync_process.stdout.readline()) != "":
+                rsync_process = subprocess.run(upload_command)
+                for line in []:
+                    # for line in rsync_process.stdout.splitlines():
                     line = line.strip().split()
                     if len(line) > 1:
                         upload_percent_complete = float(line[1].removesuffix('%'))
@@ -261,7 +255,7 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                             "percent_complete": upload_percent_complete
                         })
 
-                rsync_returncode = rsync_process.wait()
+                rsync_returncode = rsync_process.returncode
                 timestamp_upload_complete = datetime.datetime.now().isoformat()
                 log.debug({
                     "event_type": "rsync_returncode_captured",
@@ -295,6 +289,9 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                         "sequencing_run_id": run_id,
                         "upload_complete_destination_path": upload_complete_destination_path,
                     }))
+
+                    db.update_run_status_by_id(config, run['sequencing_run_id'], 'UPLOAD_COMPLETE')
+                    log.info({"event_type": "upload_complete", "sequencing_run_id": run['sequencing_run_id']})
                     
 
                 # Sometimes the last update from rsync is at ~99% complete.
@@ -310,6 +307,6 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 log.error({"event_type": "error_during_upload", "sequencing_run_id": run_id})
                 db.update_run_status_by_id(config, run_id, 'UPLOAD_INCOMPLETE_WITH_ERROR')
                 # TODO: Further error handling.
+                log.info({"event_type": "upload_incomplete", "sequencing_run_id": run_id})
 
-    db.update_run_status_by_id(config, run['sequencing_run_id'], 'UPLOAD_COMPLETE')
-    log.info({"event_type": "upload_complete", "sequencing_run_id": run['sequencing_run_id']})
+    
