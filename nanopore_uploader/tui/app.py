@@ -480,7 +480,7 @@ class UploaderApp(App):
             self._update_run(run_id, status='UPLOAD_STARTED', last_error="")
             self._start_upload_panel(run_id)
         elif event_type == 'upload_complete':
-            self._finish_upload(run_id, 'UPLOAD_COMPLETE')
+            self._update_run(run_id, status='UPLOAD_COMPLETE')
         elif event_type == 'upload_cancelled':
             self._finish_upload(run_id, 'UPLOAD_INCOMPLETE')
         elif event_type == 'upload_failed':
