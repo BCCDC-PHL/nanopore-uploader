@@ -84,7 +84,7 @@ def add_run_to_db(config: dict[str, object], run: dict[str, object]):
         for row in reader:
             rows.append(row)
 
-    rows.append(run)
+    rows.append({'sequencing_run_id': run['sequencing_run_id'], 'status': run['status']})
 
     with open(db_file, 'w', newline='') as csvfile:
         fieldnames = ['sequencing_run_id', 'status']
