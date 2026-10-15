@@ -139,23 +139,40 @@ def make_log_handler(log_file: Optional[os.PathLike]=None, log_retention_days: i
     return logging.handlers.TimedRotatingFileHandler(log_file, when='midnight', backupCount=log_retention_days, encoding='utf-8')
 
 
-def configure_logging(log_level: str="info", log_file: Optional[os.PathLike]=None, log_retention_days: int=90, log_format: str="json"):
+def configure_logging(log_level: str="info", log_file: Optional[os.PathLike]=None, log_retention_days: int=90, log_format: str="json", tui_handler: Optional[logging.Handler]=None):
     """
     Configure logging
 
     :param log_level: Log level ('debug', 'info', 'warning', 'error') default: 'info'
-    :param log_file: Path to the log file. If None, log to stdout.
+    :param log_file: Path to the log file. If None, log to stdout (or only to the TUI, if there is one).
     :param log_retention_days: Number of rotated log files to keep. 0 keeps all of them.
     :param log_format: Format of the log output ('json' or 'text'). Default is 'json'.
+    :param tui_handler: In TUI mode, the handler that passes log records to the TUI.
+                        It receives debug records too (the TUI tracks run status from them) and decides what to show.
     """
-    handler = make_log_handler(log_file, log_retention_days)
     if log_format == "json":
-        handler.setFormatter(JSONFormatter())
+        formatter = JSONFormatter()
     else:
-        handler.setFormatter(TextFormatter())
-    logging.basicConfig(
-        level=log_level.upper(),
-        handlers=[handler]
-    )
+        formatter = TextFormatter()
+
+    if tui_handler is None:
+        handler = make_log_handler(log_file, log_retention_days)
+        handler.setFormatter(formatter)
+        logging.basicConfig(
+            level=log_level.upper(),
+            handlers=[handler]
+        )
+    else:
+        # Writing to stdout would corrupt the TUI's display, so only log to a file if one was given.
+        handlers = [tui_handler]
+        if log_file is not None:
+            file_handler = make_log_handler(log_file, log_retention_days)
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(log_level.upper())
+            handlers.append(file_handler)
+        logging.basicConfig(
+            level=logging.DEBUG,
+            handlers=handlers
+        )
     # if log_level.lower() != "debug":
     logging.getLogger("paramiko").setLevel(logging.ERROR)
