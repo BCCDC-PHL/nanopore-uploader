@@ -472,7 +472,7 @@ class UploaderApp(App):
         elif event_type == 'run_status_checked':
             run = self.runs.get(run_id)
             # The db doesn't know about failures, so don't let a re-check hide one.
-            if run is None or run.status not in (UPLOAD_FAILED, EXCLUDED) or payload.get('status') == 'QUEUED_FOR_UPLOAD':
+            if run is None or run.status != UPLOAD_FAILED or payload.get('status') == 'QUEUED_FOR_UPLOAD':
                 self._update_run(run_id, touch=False, status=payload.get('status'))
         elif event_type == 'upload_starting':
             self.state = "uploading"
