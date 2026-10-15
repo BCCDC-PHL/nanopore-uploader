@@ -489,11 +489,9 @@ class UploaderApp(App):
             if run is not None and run.last_error:
                 error = f"{error}\n{run.last_error}"
             self._finish_upload(run_id, UPLOAD_FAILED, error=error)
-        elif event_type == 'rsync_returncode_captured' and payload.get('rsync_returncode') not in (0, None) and not self.stopping:
-            self._update_run(run_id, touch=False, last_error=f"rsync exited with code {payload.get('rsync_returncode')}")
         elif event_type == 'rsync_stderr' and run_id in self.runs:
             run = self.runs[run_id]
-            error = f"rsync: {payload.get('stderr')}"
+            error = payload.get('stderr')  # rsync's messages already start with 'rsync:'
             if run.last_error:
                 error = f"{run.last_error}\n{error}"
             self._update_run(run_id, touch=False, last_error=error)
@@ -504,6 +502,10 @@ class UploaderApp(App):
                 self._update_run(run_id, touch=True)
         elif event_type == 'run_requeued':
             self._update_run(run_id, status='QUEUED_FOR_UPLOAD', last_error="")
+        elif event_type == 'upload_retries_exhausted' and run_id in self.runs:
+            run = self.runs[run_id]
+            note = f"Not retrying after {payload.get('attempts')} attempts. Press r to re-queue it."
+            self._update_run(run_id, touch=False, last_error=f"{run.last_error}\n{note}" if run.last_error else note)
         elif event_type == 'run_excluded':
             self._update_run(run_id, status=EXCLUDED)
         elif event_type == 'scan_complete':
@@ -636,6 +638,21 @@ class UploaderApp(App):
             except (TypeError, ValueError):
                 pass
             return description
+        if event_type == 'upload_retrying':
+            return (
+                f"Retrying upload of {run_id} (attempt {payload.get('attempt')} of {payload.get('max_upload_attempts')}; "
+                f"last status {payload.get('previous_status')})"
+            )
+        if event_type == 'upload_retries_exhausted':
+            return f"Not retrying {run_id} after {payload.get('attempts')} attempts. Select it and press r to try again."
+        if event_type == 'destination_upload_complete':
+            return f"Copied {run_id} to {payload.get('server_id')}"
+        if event_type == 'destination_upload_failed':
+            return f"Copying {run_id} to {payload.get('server_id')} failed: {payload.get('error')}"
+        if event_type == 'check_run_dir_failed':
+            return f"Couldn't check {payload.get('run_directory')}: {payload.get('error_type')}: {payload.get('error')}"
+        if event_type == 'scan_failed':
+            return f"Scan failed: {payload.get('error_type')}: {payload.get('error')}. Will try again at the next scan."
         if event_type == 'db_file_not_found':
             return f"The upload database file wasn't found: {payload.get('db_file')}"
         if event_type == 'upload_progress_update':

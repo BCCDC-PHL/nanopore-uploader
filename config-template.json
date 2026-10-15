@@ -30,6 +30,7 @@
         "send_notification_emails": true
     },
     "scan_interval_seconds": 600,
+    "max_upload_attempts": 3,
     "db": {
 	"file": "/path/to/upload_db.csv"
     },
