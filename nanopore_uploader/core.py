@@ -248,7 +248,7 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 rsync_process = subprocess.Popen(
                     upload_command_list,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=None,
                     text=True,
                     bufsize=1
                 )
