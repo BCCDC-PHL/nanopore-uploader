@@ -59,11 +59,13 @@ def main():
                 })
                 config = reload_config(args.config, config)
                 try:
-                    log.info({
-                        "event_type": "upload_starting",
-                        "sequencing_run_id": run['sequencing_run_id'],
-                    })
-                    core.upload_run(config, run)
+                    run['status'] = core.check_run_status(config, run)
+                    if run['status'] == 'QUEUED_FOR_UPLOAD':
+                        log.info({
+                            "event_type": "upload_starting",
+                            "sequencing_run_id": run['sequencing_run_id'],
+                        })
+                        core.upload_run(config, run)
                 # A problem with one run shouldn't stop other runs from being checked.
                 # No 'qc_check_complete.json' is written, so the run will be retried on the next scan.
                 except OSError as e:
