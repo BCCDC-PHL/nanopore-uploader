@@ -162,6 +162,7 @@ class Uploader:
         Add a run to the `excluded_runs_list` file, so that it's skipped from now on.
         """
         self._requests.put(('exclude', run_id))
+        self._wake_event.set()
 
     @property
     def uploading_run_id(self) -> Optional[str]:
