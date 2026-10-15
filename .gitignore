@@ -3,6 +3,9 @@ dev-config.json
 test_input
 regen_db.sh
 
+# Emacs auto-save files
+*~
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

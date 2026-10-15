@@ -1,23 +1,24 @@
 import csv
 import json
 import logging
+import os
 
-def _parse_list(list_path: str) -> list[str]:
+log = logging.getLogger(__name__)
+
+def _load_optional_list_file(path: os.PathLike, setting: str) -> list[str]:
     """
-    Parse a 'list' file. List files are simple single-column text files, with one entry per line.
+    Load a file with one entry per line. A missing file is treated as an empty list.
 
-    :param list_path: Path to the list file.
-    :type list_path: str
-    :return: Contents of list file.
-    :rtype: list[str]
+    :param path: Path to the file.
+    :param setting: Name of the config setting the path came from (for logging).
+    :return: Non-blank lines of the file.
     """
-    items = []
-    with open(list_path, 'r') as f:
-        for line in f:
-            item = line.strip()
-            items.append(item)
+    if not os.path.exists(path):
+        log.warning({"event_type": "config_file_not_found", "setting": setting, "path": str(path)})
+        return []
 
-    return items
+    with open(path, 'r') as f:
+        return [line.strip() for line in f if line.strip()]
 
 
 def load_config(config_path: str) -> dict[str, object]:
@@ -31,20 +32,8 @@ def load_config(config_path: str) -> dict[str, object]:
     with open(config_path, 'r') as f:
         config = json.load(f)
 
-    if 'excluded_run_list' in config and os.path.exists(config['excluded_runs_list']):
-        config['excluded_runs'] = []
-        with open(config['excluded_runs_list'], 'r') as f:
-            for line in f:
-                config['excluded_runs'].append(line.strip())
-    else:
-        config['excluded_runs'] = []
+    if 'excluded_runs_list' in config and os.path.exists(config['excluded_runs_list']):
+        config['excluded_runs'] = _load_optional_list_file(config['excluded_runs_list'], 'excluded_runs_list')
         
     return config
 
-
-def make_config_json_serializable(original_config):
-    """
-    """
-    config = original_config.copy()
-
-    return config

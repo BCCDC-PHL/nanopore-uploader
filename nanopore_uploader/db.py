@@ -1,99 +1,93 @@
+import csv
 import datetime
 import json
 import logging
 import os
 
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy import create_engine
-
 from nanopore_uploader.model import *
+
+log = logging.getLogger(__name__)
 
 def store_run(config: dict[str, object], run: dict[str, object]):
     """
+    Stores a sequencing run in the database if it does not already exist.
+
+    Args:
+        config (dict[str, object]): The configuration dictionary containing database file information.
+        run (dict[str, object]): The sequencing run data to store.
     """
 
-    connection_uri = str(config['database_connection_uri'])
-    engine = create_engine(connection_uri)
-    Session = sessionmaker(bind=engine)
-    session = Session()
-
     sequencing_run_id = run['sequencing_run_id']
-    existing_run = session.query(SequencingRun).filter(SequencingRun.sequencing_run_id == sequencing_run_id).first()
+    existing_run = get_run_by_id(config, sequencing_run_id)
 
     if existing_run is None:
-        eight_digit_date = sequencing_run_id.split('_')[0]
-        year = int(eight_digit_date[0:4])
-        month = int(eight_digit_date[4:6])
-        day = int(eight_digit_date[6:8])
-        run_date = datetime.date(year, month, day)
-
-        instrument_id = run['instrument_id']
-
-        r = SequencingRun(
-            sequencing_run_id = sequencing_run_id,
-            protocol_group_id = run['protocol_group_id'],
-            run_date = run_date,
-            instrument_type = run['instrument_type'].upper(),
-            instrument_id = instrument_id,
-            status = run['status'].upper(),
-            run_directory = run['run_directory'],
-        )
-
-        session.add(r)
-        session.commit()
-        logging.debug(json.dumps({"event_type": "run_stored", "run_id": sequencing_run_id}))
+        add_run_to_db(config, run)
+        log.debug({"event_type": "run_stored", "run_id": sequencing_run_id})
     else:
-        logging.debug(json.dumps({"event_type": "run_exists", "run_id": sequencing_run_id}))
+        log.debug({"event_type": "run_exists", "run_id": sequencing_run_id})
 
 
 def get_run_by_id(config: dict[str, object], run_id: str):
-    connection_uri = str(config['database_connection_uri'])
-    engine = create_engine(connection_uri)
-    Session = sessionmaker(bind=engine)
-    session = Session()
+    db_file = config.get('db', {}).get('file')
 
-    existing_run = session.query(SequencingRun).filter(SequencingRun.sequencing_run_id == run_id).first()
-    if existing_run is not None:
-        run = existing_run.__dict__
-        run.pop('_sa_instance_state', None)
-    else:
-        run = None
+    with open(db_file, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            if row['sequencing_run_id'] == run_id:
+                existing_run = row
+                break
+        else:
+            existing_run = None
 
-    session.close()
-
-    return run
+    return existing_run
 
 
 def update_run_status_by_id(config: dict[str, object], run_id: str, status: str):
     """
+    Updates the status of a sequencing run in the database by its ID.
+
+    Args:
+        config (dict[str, object]): The configuration dictionary containing database file information.
+        run_id (str): The ID of the sequencing run to update.
+        status (str): The new status to set for the sequencing run.
     """
-    connection_uri = str(config['database_connection_uri'])
-    engine = create_engine(connection_uri)
-    Session = sessionmaker(bind=engine)
-    session = Session()
+    db_file = config.get('db', {}).get('file')
 
-    existing_run = session.query(SequencingRun).filter(SequencingRun.sequencing_run_id == run_id).first()
+    runs_by_id = {}
+    with open(db_file, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            if row['sequencing_run_id'] == run_id:
+                row['status'] = status.upper()
+            runs_by_id[row['sequencing_run_id']] = row
 
-    if existing_run is not None:
-        existing_run.status = status.upper()
-        session.add(existing_run)
-        session.commit()
+    with open(db_file, 'w', newline='') as csvfile:
+        fieldnames = ['sequencing_run_id', 'status']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(runs_by_id.values())
 
-    session.close()
 
-
-def update_run_upload_percent_complete_by_id(config: dict[str, object], run_id: str, upload_percent_complete: float):
+def add_run_to_db(config: dict[str, object], run: dict[str, object]):
     """
+    Adds a new run to the database CSV file if it does not already exist.
+
+    Args:
+        config (dict[str, object]): The configuration dictionary containing database file information.
+        run (dict[str, object]): The sequencing run data to add.
     """
-    connection_uri = str(config['database_connection_uri'])
-    engine = create_engine(connection_uri)
-    Session = sessionmaker(bind=engine)
-    session = Session()
+    db_file = config.get('db', {}).get('file')
 
-    existing_run = session.query(SequencingRun).filter(SequencingRun.sequencing_run_id == run_id).first()
+    rows = []
+    with open(db_file, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            rows.append(row)
 
-    if existing_run is not None:
-        existing_run.upload_percent_complete = upload_percent_complete
-        session.commit()
+    rows.append({'sequencing_run_id': run['sequencing_run_id'], 'status': run['status']})
 
-    session.close()
+    with open(db_file, 'w', newline='') as csvfile:
+        fieldnames = ['sequencing_run_id', 'status']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
