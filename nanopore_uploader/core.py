@@ -165,7 +165,8 @@ def scan(config: dict[str, object]) -> Iterator[Optional[dict[str, object]]]:
     :rtype: Iterator[Optional[dict[str, object]]]
     """
     for run in find_runs(config):
-        yield run
+        if run['sequencing_run_id'] not in config.get('excluded_runs', []):
+            yield run
 
 
 def check_run_status(config: dict[str, object], run: dict[str, object]):
