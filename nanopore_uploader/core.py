@@ -223,6 +223,7 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 '--info=progress2',
                 '--no-inc-recursive',
                 # '-e', '"ssh -i ' + destination_server['id_file'] + '"',
+                *[arg for pattern in sequencer.get('excluded_run_contents', []) for arg in ('--exclude', pattern)],
                 permissions_string,
                 str(Path(run['run_directory'])),
                 ''.join([
