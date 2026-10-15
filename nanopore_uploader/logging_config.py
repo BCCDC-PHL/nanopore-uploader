@@ -114,7 +114,12 @@ class TextFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         message = record.getMessage()
         timestamp = self.formatTime(record)
-        return f"{timestamp} - {record.name} - {record.levelname} - {message}"
+        formatted = f"{timestamp} - {record.name} - {record.levelname} - {message}"
+        if record.exc_info:
+            formatted += "\n" + self.formatException(record.exc_info)
+        if record.stack_info:
+            formatted += "\n" + self.formatStack(record.stack_info)
+        return formatted
 
 
 def make_log_handler(log_file: Optional[os.PathLike]=None, log_retention_days: int=90) -> logging.Handler:
