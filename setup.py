@@ -15,6 +15,9 @@ setup(
         "requests~=2.32",
         "jinja2~=3.1",
     ],
+    extras_require={
+        "tui": ["textual>=8.2"],
+    },
     setup_requires=[],
     tests_require=[],
     entry_points = {

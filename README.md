@@ -19,6 +19,29 @@ nanopore-uploader -c config.json
 
 To exit, use "Ctrl + C" keyboard combo. Its safe!
 
+### Interactive dashboard (experimental)
+```
+pip install -e '.[tui]'
+nanopore-uploader -c config.json --tui --log-file uploader.jsonl
+```
+
+Shows the runs table, the current upload's progress, and a readable activity log instead of raw log lines.
+Logs only go to `--log-file` in this mode (stdout is used by the dashboard).
+
+| Key | Action |
+|-----|--------|
+| `s` | Scan now, instead of waiting for the scan interval |
+| `r` | Re-queue the selected run for upload |
+| `x` | Exclude the selected run (adds it to `excluded_runs_list`) |
+| `l` | Switch the log between the activity summary and all events |
+| `q` | Quit (asks first if an upload is in progress) |
+
+To try it with fake runs and a local "destination" (no SSH server needed):
+```
+python scripts/generate_demo_runs.py
+test_input/demo/run-demo.sh
+```
+
 To upload one specific folder (will update status to REUPLOAD in db)
 ```
 nanopore-uploader --upload-single-run 200619_M00325_0209_000000000-J6M35

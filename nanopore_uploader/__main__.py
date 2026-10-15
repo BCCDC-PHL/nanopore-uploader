@@ -1,37 +1,14 @@
 #!/usr/bin/env python
 
 import argparse
-import datetime
-import json
 import logging
-import os
-import time
+import sys
 
-import nanopore_uploader.core as core
 from nanopore_uploader.config import load_config
 from nanopore_uploader.logging_config import configure_logging
-
-DEFAULT_SCAN_INTERVAL_SECONDS = 3600.0
+from nanopore_uploader.service import Uploader
 
 log = logging.getLogger(__name__)
-
-
-def reload_config(config_path: os.PathLike, current_config: dict[str, object]) -> dict[str, object]:
-    """
-    Reload the config file, so that changes take effect without restarting.
-    If the config can't be loaded, continue with the last valid config.
-
-    :param config_path: Path to the config file.
-    :param current_config: The last valid config.
-    :return: The reloaded config, or the current config if reloading failed.
-    """
-    try:
-        config = load_config(config_path)
-        log.info({"event_type": "config_loaded", "config_file": os.path.abspath(config_path)})
-        return config
-    except Exception as e:
-        log.error({"event_type": "load_config_failed", "config_file": os.path.abspath(config_path), "error": str(e)})
-        return current_config
 
 
 def main():
@@ -41,68 +18,41 @@ def main():
     parser.add_argument('--log-file', help='Append logs to this file, rotated daily at midnight (default: log to stdout)')
     parser.add_argument('--log-retention-days', type=int, default=90, help='Number of rotated log files to keep. 0 keeps all of them (default: 90)')
     parser.add_argument('--log-format', default='json', choices=['json', 'text'])
+    parser.add_argument('--tui', action='store_true', help='Show an interactive terminal dashboard instead of writing logs to stdout')
     args = parser.parse_args()
+
+    if args.tui:
+        main_tui(args)
+        return
 
     configure_logging(args.log_level, args.log_file, args.log_retention_days, args.log_format)
     log.debug({"event_type": "debug_logging_enabled"})
 
     config = load_config(args.config)
+    uploader = Uploader(args.config, config)
 
     try:
-        while(True):
-            scan_start_timestamp = datetime.datetime.now()
-            # remote_runs = core.find_remote_runs(config)
-            for run in core.scan(config):
-                log.info({
-                    "event_type": "found_run",
-                    "sequencing_run_id": run['sequencing_run_id'],
-                })
-                config = reload_config(args.config, config)
-                try:
-                    run['status'] = core.check_run_status(config, run)
-                    if run['status'] == 'QUEUED_FOR_UPLOAD':
-                        log.info({
-                            "event_type": "upload_starting",
-                            "sequencing_run_id": run['sequencing_run_id'],
-                        })
-                        core.upload_run(config, run)
-                # A problem with one run shouldn't stop other runs from being checked.
-                # No 'qc_check_complete.json' is written, so the run will be retried on the next scan.
-                except OSError as e:
-                    # Expected, environmental problems (missing files, permissions, network storage).
-                    # The message says what went wrong, so a traceback wouldn't add anything.
-                    log.error({
-                        "event_type": "upload_failed",
-                        "sequencing_run_id": run['sequencing_run_id'],
-                        "error_type": type(e).__name__, "error": str(e)
-                    })
-                except Exception as e:
-                    # Unexpected problems are probably bugs, so include the traceback.
-                    log.error({
-                        "event_type": "upload_failed",
-                        "sequencing_run_id": run['sequencing_run_id'],
-                        "error_type": type(e).__name__,
-                        "error": str(e)
-                    }, exc_info=True)
-            scan_complete_timestamp = datetime.datetime.now()
-            scan_duration_delta = scan_complete_timestamp - scan_start_timestamp
-            scan_duration_seconds = scan_duration_delta.total_seconds()
-            try:
-                scan_interval = float(config.get('scan_interval_seconds', DEFAULT_SCAN_INTERVAL_SECONDS))
-            except (TypeError, ValueError):
-                scan_interval = DEFAULT_SCAN_INTERVAL_SECONDS
-            next_scan_timestamp = scan_start_timestamp + datetime.timedelta(seconds=scan_interval)
-            log.info({
-                "event_type": "scan_complete", 
-                "scan_duration_seconds": scan_duration_seconds, 
-                "timestamp_next_scan_start": next_scan_timestamp.isoformat()
-            })
-
-            time.sleep(max(0, (next_scan_timestamp - datetime.datetime.now()).total_seconds()))
+        uploader.run()
     except KeyboardInterrupt:
         log.info({"event_type": "quit"})
     except Exception as e:
         log.error({"event_type": "unexpected_error", "error": str(e)})
+
+
+def main_tui(args: argparse.Namespace):
+    try:
+        from nanopore_uploader.tui.app import UploaderApp, TUILogHandler
+    except ImportError as e:
+        print(f"The TUI needs the 'textual' package ({e}). Install it with: pip install 'nanopore-uploader[tui]'", file=sys.stderr)
+        sys.exit(1)
+
+    tui_handler = TUILogHandler()
+    configure_logging(args.log_level, args.log_file, args.log_retention_days, args.log_format, tui_handler=tui_handler)
+
+    config = load_config(args.config)
+    app = UploaderApp(args.config, config, tui_handler, log_level=args.log_level)
+    app.run()
+
 
 if __name__ == '__main__':
     main()

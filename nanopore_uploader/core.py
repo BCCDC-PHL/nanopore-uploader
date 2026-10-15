@@ -7,6 +7,7 @@ import math
 import os
 import re
 import subprocess
+import threading
 import time
 import warnings
 
@@ -15,7 +16,7 @@ warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 import paramiko
 
 from pathlib import Path, PurePosixPath
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 import nanopore_uploader.db as db
 
@@ -191,7 +192,14 @@ def check_run_status(config: dict[str, object], run: dict[str, object]):
 
 
 
-def upload_run(config: dict[str, object], run: dict[str, object]):
+def upload_run(
+        config: dict[str, object],
+        run: dict[str, object],
+        on_progress: Optional[Callable[[dict[str, object]], None]] = None,
+        on_process_started: Optional[Callable[[subprocess.Popen], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+        rsync_stderr=None,
+):
     """
     Upload a run to each destination server.
 
@@ -199,6 +207,10 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
     :type config: dict[str, object]
     :param run: Sequencing run
     :type run: dict[str, object]
+    :param on_progress: Called with every rsync progress update (not just the logged milestones).
+    :param on_process_started: Called with each rsync process when it starts, so that it can be stopped from another thread.
+    :param cancel_event: If this is set when rsync exits, the upload was stopped deliberately: mark the run UPLOAD_INCOMPLETE and stop.
+    :param rsync_stderr: Where rsync's stderr goes (passed to `subprocess.Popen`). Default: inherited from this process.
     :return: None
     :rtype: None
     """
@@ -248,10 +260,12 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                 rsync_process = subprocess.Popen(
                     upload_command_list,
                     stdout=subprocess.PIPE,
-                    stderr=None,
+                    stderr=rsync_stderr,
                     text=True,
                     bufsize=1
                 )
+                if on_process_started is not None:
+                    on_process_started(rsync_process)
                 next_milestone = 10.0
                 while True:
                     line = rsync_process.stdout.readline()
@@ -264,6 +278,15 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                             upload_percent_complete = float(split_line[1].removesuffix('%'))
                             upload_speed = split_line[2]
                             upload_duration = split_line[3]
+                            if on_progress is not None:
+                                on_progress({
+                                    "sequencing_run_id": run_id,
+                                    "server_id": destination_server.get('server_id'),
+                                    "data_transferred": data_transferred,
+                                    "percent_complete": upload_percent_complete,
+                                    "upload_speed": upload_speed,
+                                    "upload_duration": upload_duration,
+                                })
                             if upload_percent_complete >= next_milestone:
                                 log.info({
                                     "event_type": "upload_progress_update",
@@ -282,6 +305,11 @@ def upload_run(config: dict[str, object], run: dict[str, object]):
                     "sequencing_run_id": run_id,
                     "rsync_returncode": rsync_returncode
                 })
+
+                if cancel_event is not None and cancel_event.is_set():
+                    db.update_run_status_by_id(config, run_id, 'UPLOAD_INCOMPLETE')
+                    log.info({"event_type": "upload_cancelled", "sequencing_run_id": run_id})
+                    return
 
                 # Write an 'upload_complete.json' file on the remote system to indicate
                 # to downstream automation systems that the upload is complete and the run
