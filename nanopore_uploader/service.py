@@ -90,6 +90,8 @@ class Uploader:
                     "run_directory": run['run_directory'],
                 })
                 self.config = reload_config(self.config_path, self.config)
+                if run['sequencing_run_id'] in self.config.get('excluded_runs', []):
+                    continue
                 try:
                     run['status'] = core.check_run_status(self.config, run)
                     log.debug({
