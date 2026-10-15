@@ -87,7 +87,11 @@ def main():
             scan_complete_timestamp = datetime.datetime.now()
             scan_duration_delta = scan_complete_timestamp - scan_start_timestamp
             scan_duration_seconds = scan_duration_delta.total_seconds()
-            next_scan_timestamp = scan_start_timestamp + datetime.timedelta(seconds=config['scan_interval_seconds'])
+            try:
+                scan_interval = float(config.get('scan_interval_seconds', DEFAULT_SCAN_INTERVAL_SECONDS))
+            except (TypeError, ValueError):
+                scan_interval = DEFAULT_SCAN_INTERVAL_SECONDS
+            next_scan_timestamp = scan_start_timestamp + datetime.timedelta(seconds=scan_interval)
             log.info({
                 "event_type": "scan_complete", 
                 "scan_duration_seconds": scan_duration_seconds, 
