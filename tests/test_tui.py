@@ -11,7 +11,7 @@ pytest.importorskip("textual")
 import nanopore_uploader.core as core
 from nanopore_uploader.tui.app import EXCLUDED, UPLOAD_FAILED, TUILogHandler, UploaderApp
 
-from conftest import GRIDION_RUN_ID, GRIDION_RUN_ID_2, make_run, mark_uploaded
+from conftest import GRIDION_RUN_ID, GRIDION_RUN_ID_2, make_destination, make_run, mark_uploaded, save_config
 
 
 @pytest.fixture
@@ -114,3 +114,26 @@ def test_quitting_during_an_upload_asks_first(config, run_output_dir, fake_rsync
     assert asked == "ConfirmScreen"
     # Left partly uploaded, to be resumed next time.
     assert core.list_remote_runs(config["sequencers"][0]["destination_servers"][0]) == {GRIDION_RUN_ID: core.PARTIAL}
+
+
+def test_run_isnt_shown_as_uploaded_while_a_destination_cant_be_checked(config, run_output_dir, tmp_path, fake_rsync, fake_ssh, tui_handler):
+    make_run(run_output_dir, GRIDION_RUN_ID)
+    unreachable = make_destination(tmp_path, "offline-archive")
+    unreachable["destination_dir"] = str(tmp_path / "not-mounted")
+    config["sequencers"][0]["destination_servers"].append(unreachable)
+    save_config(config)
+
+    async def scenario():
+        app = UploaderApp(config["_path"], config, tui_handler)
+        async with app.run_test(size=(150, 40)) as pilot:
+            await wait_until(pilot, lambda: app.state == "idle")
+            run = app.runs[GRIDION_RUN_ID]
+            result = run.status, dict(run.destinations)
+            await pilot.press("q")
+        return result
+
+    status, destinations = asyncio.run(scenario())
+
+    # Uploaded to the reachable destination, but not known to be on the other.
+    assert destinations == {"archive": core.UPLOADED, "offline-archive": core.UNKNOWN}
+    assert status == core.UNKNOWN

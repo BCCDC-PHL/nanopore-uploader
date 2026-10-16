@@ -73,6 +73,17 @@ def test_list_remote_runs_fails_if_a_run_dir_cant_be_read(config, destination_di
         (destination_dir / GRIDION_RUN_ID).chmod(stat.S_IRWXU)
 
 
+def test_list_remote_runs_has_a_timeout(config, fake_ssh):
+    destination = config["sequencers"][0]["destination_servers"][0]
+    core.list_remote_runs(destination)
+    assert fake_ssh.timeouts == [core.REMOTE_COMMAND_TIMEOUT_SECONDS]
+
+    # eg. the destination's filesystem has stopped responding.
+    fake_ssh.hang = True
+    with pytest.raises(OSError):
+        core.list_remote_runs(destination)
+
+
 def test_list_remote_runs_fails_if_the_server_cant_be_reached(config, fake_ssh):
     fake_ssh.fail = True
 

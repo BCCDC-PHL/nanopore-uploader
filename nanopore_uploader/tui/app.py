@@ -489,7 +489,11 @@ class UploaderApp(App):
             destinations[payload.get('server_id')] = core.UPLOADED
             self._update_run(run_id, touch=False, destinations=destinations)
         elif event_type == 'upload_complete':
-            self._update_run(run_id, status=core.UPLOADED)
+            # The upload succeeded on the destinations it was sent to. The run is only fully uploaded if
+            # every destination now has it (another might not have been reachable, for example).
+            run = self.runs.get(run_id)
+            destinations = run.destinations if run is not None else None
+            self._update_run(run_id, status=core.run_state(destinations) if destinations else core.UPLOADED)
         elif event_type == 'upload_cancelled':
             self._finish_upload(run_id, core.PARTIAL)
         elif event_type == 'upload_failed':

@@ -240,3 +240,73 @@ class TestDestinations:
         assert len(fake_rsync.calls()) == 2
         assert [path.split("/destinations/")[1] for path in fake_ssh.written] == [f"second-archive/{GRIDION_RUN_ID}/upload_complete.json"]
         assert [row["result"] for row in history(config)] == ["failed", "complete"]
+
+
+class TestUploadCompleteFile:
+    """
+    upload_complete.json is the record of a finished upload, so it must never be left partly written or out of date.
+    """
+
+    def test_a_failed_write_leaves_no_marker(self, config, run, destination_dir, fake_rsync, fake_ssh):
+        fake_ssh.fail_sftp = True
+
+        status = core.upload_run(config, run)
+
+        assert status == "UPLOAD_INCOMPLETE_WITH_ERROR"
+        assert sorted(p.name for p in (destination_dir / GRIDION_RUN_ID).iterdir()) == []
+        assert core.list_remote_runs(config["sequencers"][0]["destination_servers"][0]) == {GRIDION_RUN_ID: core.PARTIAL}
+
+    def test_a_failed_rename_leaves_no_marker(self, config, run, destination_dir, fake_rsync, fake_ssh):
+        fake_ssh.fail_rename = True
+
+        status = core.upload_run(config, run)
+
+        assert status == "UPLOAD_INCOMPLETE_WITH_ERROR"
+        assert sorted(p.name for p in (destination_dir / GRIDION_RUN_ID).iterdir()) == []
+
+    def test_uploading_again_replaces_the_marker(self, config, run, destination_dir, fake_rsync, fake_ssh):
+        marker = destination_dir / GRIDION_RUN_ID / "upload_complete.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text('{"old": true}\n')
+
+        assert core.upload_run(config, run) == "UPLOAD_COMPLETE"
+
+        assert set(json.load(open(marker))) == {"timestamp_upload_start", "timestamp_upload_complete"}
+
+    def test_a_failed_reupload_doesnt_leave_the_old_marker(self, config, run, destination_dir, fake_rsync, fake_ssh, monkeypatch):
+        marker = destination_dir / GRIDION_RUN_ID / "upload_complete.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text('{"old": true}\n')
+        monkeypatch.setenv("FAKE_RSYNC_FAIL", "archive.example.org")
+
+        assert core.upload_run(config, run) == "UPLOAD_INCOMPLETE_WITH_ERROR"
+
+        # So the run shows as partly uploaded (and is retried), not still uploaded.
+        assert not marker.exists()
+        assert fake_ssh.removed == [str(marker)]
+
+    def test_rsync_isnt_started_if_the_old_marker_cant_be_removed(self, config, run, fake_rsync, fake_ssh, monkeypatch):
+        def cant_remove(destination_server, run_id):
+            raise PermissionError("Permission denied (fake)")
+
+        monkeypatch.setattr(core, "remove_upload_complete_file", cant_remove)
+
+        assert core.upload_run(config, run) == "UPLOAD_INCOMPLETE_WITH_ERROR"
+        assert fake_rsync.calls() == []
+
+
+def test_destination_labels_are_unique():
+    destinations = [
+        {"server_id": "archive", "server_address": "a.example.org", "destination_dir": "/data/gridion"},
+        {"server_id": "archive", "server_address": "a.example.org", "destination_dir": "/data/promethion"},
+        {"server_address": "b.example.org", "destination_dir": "/data"},
+        {"server_address": "b.example.org", "destination_dir": "/data"},  # configured twice
+    ]
+
+    assert core.destination_labels(destinations) == [
+        "archive:/data/gridion",
+        "archive:/data/promethion",
+        "b.example.org:/data#3",
+        "b.example.org:/data#4",
+    ]
+    assert core.destination_labels(destinations[:1]) == ["archive"]

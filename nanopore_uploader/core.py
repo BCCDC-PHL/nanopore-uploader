@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -36,6 +37,9 @@ ABSENT = 'ABSENT'       # <destination_dir>/<run_id>/ doesn't exist
 UNKNOWN = 'UNKNOWN'     # The destination couldn't be checked (eg. unreachable). Nothing is uploaded to it.
 
 SSH_CONNECT_TIMEOUT_SECONDS = 30
+# How long the remote runs listing may take (or go without sending anything) before the destination is
+# treated as UNKNOWN, eg. if its filesystem has stopped responding.
+REMOTE_COMMAND_TIMEOUT_SECONDS = 120
 
 def parse_final_summary(final_summary_file: os.PathLike) -> dict[str, str]:
     """
@@ -64,8 +68,8 @@ def check_candidate_run_dir(sequencer: dict[str, object], candidate_run_dir: str
     """
     candidate_run_dir = os.path.abspath(PurePosixPath(candidate_run_dir))
     run_id = os.path.basename(candidate_run_dir)
-    matches_gridion_run_id_regex = re.match(GRIDION_RUN_ID_REGEX, run_id)
-    matches_promethion_run_id_regex = re.match(PROMETHION_RUN_ID_REGEX, run_id)
+    matches_gridion_run_id_regex = re.fullmatch(GRIDION_RUN_ID_REGEX, run_id)
+    matches_promethion_run_id_regex = re.fullmatch(PROMETHION_RUN_ID_REGEX, run_id)
 
     final_summary_files = glob.glob(str(PurePosixPath(candidate_run_dir, 'final_summary*.txt')))
     if len(final_summary_files) > 0:
@@ -146,6 +150,37 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
     return runs
 
 
+def destination_key(destination_server: dict[str, object]) -> tuple:
+    """
+    :return: What identifies a destination: the server, login and directory runs are uploaded to.
+    """
+    return (destination_server.get('server_address'), destination_server.get('login_id'), destination_server.get('destination_dir'))
+
+
+def destination_labels(destinations: list[dict[str, object]]) -> list[str]:
+    """
+    Names for a sequencer's destinations, for logs and the TUI. Usually each one's `server_id` (or address),
+    but they're made unique, so that destinations sharing a name can't be mixed up.
+
+    :param destinations: A sequencer's destination servers.
+    :return: A label for each destination, in the same order.
+    """
+    names = [d.get('server_id') or d.get('server_address') for d in destinations]
+    labels = [name if names.count(name) == 1 else f"{name}:{d.get('destination_dir')}" for name, d in zip(names, destinations)]
+    # In case two destinations are configured identically.
+    return [label if labels.count(label) == 1 else f"{label}#{i + 1}" for i, label in enumerate(labels)]
+
+
+def destination_label(destination_server: dict[str, object], destinations: list[dict[str, object]]) -> str:
+    """
+    :return: The label (see `destination_labels`) of one of a sequencer's destinations.
+    """
+    for d, label in zip(destinations, destination_labels(destinations)):
+        if d is destination_server or destination_key(d) == destination_key(destination_server):
+            return label
+    return destination_server.get('server_id') or destination_server.get('server_address')
+
+
 class RemoteListingError(Exception):
     """
     The runs on a destination server couldn't be listed.
@@ -218,12 +253,13 @@ def list_remote_runs(destination_server: dict[str, object]) -> dict[str, str]:
     :return: {run_id: UPLOADED or PARTIAL}. Runs that aren't there are ABSENT.
     :raises RemoteListingError: If the listing command fails (eg. the destination dir is missing or unreadable).
         Then the destination's state is unknown, and nothing should be uploaded to it.
-    :raises OSError, paramiko.SSHException: If the server can't be reached.
+    :raises OSError, paramiko.SSHException: If the server can't be reached, or the listing times out
+        (`REMOTE_COMMAND_TIMEOUT_SECONDS`).
     """
     command = list_remote_runs_command(destination_server['destination_dir'])
     ssh = connect(destination_server)
     try:
-        stdin, stdout, stderr = ssh.exec_command(command)
+        stdin, stdout, stderr = ssh.exec_command(command, timeout=REMOTE_COMMAND_TIMEOUT_SECONDS)
         listing = stdout.read().decode(errors='replace')
         errors = stderr.read().decode(errors='replace').strip()
         exit_status = stdout.channel.recv_exit_status()
@@ -235,6 +271,7 @@ def list_remote_runs(destination_server: dict[str, object]) -> dict[str, str]:
     log.info({
         "event_type": "remote_runs_listed",
         "server_id": destination_server.get('server_id'),
+        "destination_dir": destination_server.get('destination_dir'),
         "num_remote_runs": len(remote_runs),
         "num_uploaded": sum(1 for state in remote_runs.values() if state == UPLOADED),
     })
@@ -317,6 +354,7 @@ def rsync_to_destination(
         on_progress: Optional[Callable[[dict[str, object]], None]] = None,
         on_process_started: Optional[Callable[[subprocess.Popen], None]] = None,
         rsync_stderr=None,
+        label: Optional[str] = None,
 ) -> int:
     """
     Copy a run to one destination server with rsync.
@@ -327,9 +365,12 @@ def rsync_to_destination(
     :param on_progress: See `upload_run`.
     :param on_process_started: See `upload_run`.
     :param rsync_stderr: See `upload_run`.
+    :param label: The destination's name in progress updates and logs (see `destination_labels`). Default: its `server_id`.
     :return: rsync's exit code.
     """
     run_id = run['sequencing_run_id']
+    if label is None:
+        label = destination_server.get('server_id')
     permissions_strings = []
     for key, value in destination_server['permissions'].items():
         permissions_strings.append(key + '=' + value)
@@ -391,7 +432,7 @@ def rsync_to_destination(
             if on_progress is not None:
                 on_progress({
                     "sequencing_run_id": run_id,
-                    "server_id": destination_server.get('server_id'),
+                    "server_id": label,
                     "data_transferred": data_transferred,
                     "percent_complete": upload_percent_complete,
                     "upload_speed": upload_speed,
@@ -401,7 +442,7 @@ def rsync_to_destination(
                 log.info({
                     "event_type": "upload_progress_update",
                     "sequencing_run_id": run_id,
-                    "server_id": destination_server.get('server_id'),
+                    "server_id": label,
                     "data_transferred": data_transferred,
                     "percent_complete": upload_percent_complete,
                     "upload_speed": upload_speed,
@@ -417,16 +458,49 @@ def rsync_to_destination(
     log.debug({
         "event_type": "rsync_returncode_captured",
         "sequencing_run_id": run_id,
-        "server_id": destination_server.get('server_id'),
+        "server_id": label,
         "rsync_returncode": rsync_process.returncode
     })
     return rsync_process.returncode
+
+
+def upload_complete_file_path(destination_server: dict[str, object], run_id: str) -> str:
+    """
+    :return: Where a run's `upload_complete.json` goes on a destination server.
+    """
+    return posixpath.join(destination_server['destination_dir'], run_id, UPLOAD_COMPLETE_FILENAME)
+
+
+def remove_upload_complete_file(destination_server: dict[str, object], run_id: str):
+    """
+    Remove a run's `upload_complete.json` from a destination, if it's there. This is done before (re-)uploading,
+    so that if the upload fails, the run shows as partly uploaded rather than still looking finished.
+
+    :param destination_server: Config for the destination server.
+    :param run_id: Sequencing run ID.
+    """
+    path = upload_complete_file_path(destination_server, run_id)
+    ssh = connect(destination_server)
+    try:
+        ftp = ssh.open_sftp()
+        try:
+            ftp.remove(path)
+        except FileNotFoundError:
+            return
+        finally:
+            ftp.close()
+    finally:
+        ssh.close()
+    log.info({"event_type": "upload_complete_file_removed", "sequencing_run_id": run_id, "upload_complete_path": path})
 
 
 def write_upload_complete_file(destination_server: dict[str, object], run_id: str, timestamp_upload_start: str, timestamp_upload_complete: str):
     """
     Write an 'upload_complete.json' file on the remote system to indicate to downstream automation systems
     that the upload is complete and the run is ready for further processing.
+
+    It's written to a temporary file, then renamed into place, so `upload_complete.json` only ever appears
+    complete: a partly-written one would make the run look uploaded, and give downstream automation bad JSON.
 
     :param destination_server: Config for the destination server.
     :param run_id: Sequencing run ID.
@@ -437,13 +511,23 @@ def write_upload_complete_file(destination_server: dict[str, object], run_id: st
         "timestamp_upload_start": timestamp_upload_start,
         "timestamp_upload_complete": timestamp_upload_complete,
     }
+    upload_complete_destination_path = upload_complete_file_path(destination_server, run_id)
+    temp_path = posixpath.join(posixpath.dirname(upload_complete_destination_path), f".{UPLOAD_COMPLETE_FILENAME}.tmp")
+    upload_complete_file_contents = json.dumps(upload_complete, indent=2) + '\n'
     ssh = connect(destination_server)
     try:
         ftp = ssh.open_sftp()
         try:
-            upload_complete_destination_path = os.path.join(destination_server['destination_dir'], run_id, UPLOAD_COMPLETE_FILENAME)
-            upload_complete_file_contents = json.dumps(upload_complete, indent=2) + '\n'
-            ftp.putfo(io.BytesIO(upload_complete_file_contents.encode()), upload_complete_destination_path)
+            try:
+                ftp.putfo(io.BytesIO(upload_complete_file_contents.encode()), temp_path)
+                # posix_rename replaces an existing file atomically (OpenSSH's posix-rename extension).
+                ftp.posix_rename(temp_path, upload_complete_destination_path)
+            except BaseException:
+                try:
+                    ftp.remove(temp_path)
+                except OSError:
+                    pass
+                raise
         finally:
             ftp.close()
     finally:
@@ -467,8 +551,9 @@ def upload_run(
     """
     Upload a run to destination servers, writing an `upload_complete.json` file on each once it's copied.
 
-    If one destination fails, the others are still attempted. Each attempt is recorded in the upload history
-    file, if one is configured.
+    Any existing `upload_complete.json` is removed before copying (eg. when uploading a run again), and a new
+    one written only once the copy succeeds, so an unfinished upload never looks finished. If one destination
+    fails, the others are still attempted. Each attempt is recorded in the upload history file, if one is configured.
 
     :param config: Application config.
     :type config: dict[str, object]
@@ -502,14 +587,16 @@ def upload_run(
         })
 
     for destination_server in destinations:
-        server_id = destination_server.get('server_id') or destination_server.get('server_address')
+        server_id = destination_label(destination_server, sequencer['destination_servers'])
         timestamp_upload_start = datetime.datetime.now().isoformat()
         try:
+            remove_upload_complete_file(destination_server, run_id)
             rsync_returncode = rsync_to_destination(
                 run, sequencer, destination_server,
                 on_progress=on_progress,
                 on_process_started=on_process_started,
                 rsync_stderr=rsync_stderr,
+                label=server_id,
             )
             timestamp_upload_complete = datetime.datetime.now().isoformat()
 

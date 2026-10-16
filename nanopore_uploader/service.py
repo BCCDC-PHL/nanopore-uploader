@@ -140,16 +140,29 @@ class Uploader:
             self.config = reload_config(self.config_path, self.config)
             if run_id in self.config.get('excluded_runs', []):
                 continue
+            # The run list was built before the config was reloaded: use the sequencer's current config,
+            # so that changes to its destinations (or excluded_run_contents) apply straight away.
+            sequencer = current_sequencer(self.config, run)
+            if sequencer is None:
+                log.warning({
+                    "event_type": "run_skipped",
+                    "sequencing_run_id": run_id,
+                    "reason": "Its sequencer is no longer in the config",
+                })
+                continue
+            run['sequencer'] = sequencer
             try:
-                destinations = run['sequencer']['destination_servers']
+                destinations = sequencer['destination_servers']
+                # States are keyed by label, which is unique per destination (unlike server_id).
+                labels = core.destination_labels(destinations)
                 destination_states = {}
-                for destination_server in destinations:
+                for destination_server, label in zip(destinations, labels):
                     remote_runs = self._remote_runs(destination_server, remote_runs_by_destination)
                     if remote_runs is None:
                         state = core.UNKNOWN
                     else:
                         state = remote_runs.get(run_id, core.ABSENT)
-                    destination_states[server_id(destination_server)] = state
+                    destination_states[label] = state
                 state = core.run_state(destination_states)
                 log.debug({
                     "event_type": "run_checked",
@@ -160,10 +173,10 @@ class Uploader:
 
                 if run_id in self._forced_uploads:
                     # Re-queued: upload again to every destination that can be reached, even if it's already there.
-                    to_upload = [d for d in destinations if destination_states[server_id(d)] != core.UNKNOWN]
+                    to_upload = [d for d, label in zip(destinations, labels) if destination_states[label] != core.UNKNOWN]
                     should_upload = bool(to_upload)
                 else:
-                    to_upload = [d for d in destinations if destination_states[server_id(d)] in (core.ABSENT, core.PARTIAL)]
+                    to_upload = [d for d, label in zip(destinations, labels) if destination_states[label] in (core.ABSENT, core.PARTIAL)]
                     should_upload = bool(to_upload) and self._should_upload(run_id, state)
 
                 if should_upload:
@@ -171,7 +184,7 @@ class Uploader:
                     log.info({
                         "event_type": "upload_starting",
                         "sequencing_run_id": run_id,
-                        "server_ids": [server_id(d) for d in to_upload],
+                        "server_ids": [core.destination_label(d, destinations) for d in to_upload],
                     })
                     self._upload_run(run, to_upload)
             # A problem with one run shouldn't stop other runs from being checked.
@@ -197,7 +210,7 @@ class Uploader:
         """
         :return: The runs on a destination (see `core.list_remote_runs`), or None if it couldn't be checked.
         """
-        key = (destination_server.get('server_address'), destination_server.get('login_id'), destination_server.get('destination_dir'))
+        key = core.destination_key(destination_server)
         if key not in cache:
             try:
                 cache[key] = core.list_remote_runs(destination_server)
@@ -205,6 +218,7 @@ class Uploader:
                 log.error({
                     "event_type": "remote_listing_failed",
                     "server_id": server_id(destination_server),
+                    "destination_dir": destination_server.get('destination_dir'),
                     "error_type": type(e).__name__,
                     "error": str(e),
                 })
@@ -382,3 +396,15 @@ def server_id(destination_server: dict[str, object]) -> str:
     :return: The name used for a destination server in logs and the TUI.
     """
     return destination_server.get('server_id') or destination_server.get('server_address')
+
+
+def current_sequencer(config: dict[str, object], run: dict[str, object]) -> Optional[dict[str, object]]:
+    """
+    :return: The config for the sequencer a run was found under (matched by its run output directory),
+             from the given config, or None if it's no longer there.
+    """
+    run_output_dir = os.path.abspath(run['sequencer']['run_output_dir'])
+    for sequencer in config.get('sequencers', []):
+        if os.path.abspath(sequencer.get('run_output_dir', '')) == run_output_dir:
+            return sequencer
+    return None

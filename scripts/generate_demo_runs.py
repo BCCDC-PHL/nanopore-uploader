@@ -132,6 +132,12 @@ class _LocalSFTP:
         with open(remotepath, "wb") as f:
             f.write(fl.read())
 
+    def posix_rename(self, oldpath, newpath):
+        os.replace(oldpath, newpath)
+
+    def remove(self, path):
+        os.remove(path)
+
     def close(self):
         pass
 
@@ -159,7 +165,7 @@ class _LocalSSHClient:
     def open_sftp(self):
         return _LocalSFTP()
 
-    def exec_command(self, command):
+    def exec_command(self, command, timeout=None):
         result = subprocess.run(command, shell=True, capture_output=True)
         return None, _LocalChannelFile(result.stdout, result.returncode), _LocalChannelFile(result.stderr, result.returncode)
 
