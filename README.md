@@ -60,3 +60,11 @@ Backup database (recommended once a week)
 ```
 nanopore-uploader --backup-db
 ```
+
+## Running tests
+```
+pip install -e '.[test]'
+pytest
+```
+
+The tests use a fake `rsync` and a fake SSH client, so they don't need network access or an SSH server.
