@@ -12,17 +12,6 @@ See [config.json](config.json) for format details.
 
 ## Running
 
-### First-time setup
-Create the upload db file (`db.file` in the config) before the first run:
-```
-nanopore-uploader -c config.json --init-db
-```
-
-The uploader won't start without it. It isn't created automatically, because without it every completed run
-looks new: a mistyped path or an unmounted network share would mean uploading every run on the sequencer again.
-For the same reason, if the db file goes missing while the uploader is running, nothing is uploaded until it's back.
-`--init-db` never overwrites an existing db, and doesn't create missing directories.
-
 ### Typical Run Command
 ```
 nanopore-uploader -c config.json
@@ -30,10 +19,28 @@ nanopore-uploader -c config.json
 
 To exit, use "Ctrl + C" keyboard combo. Its safe!
 
-A run is marked `UPLOAD_COMPLETE` once it has been copied to every destination server. If any destination fails,
-the run is marked `UPLOAD_INCOMPLETE_WITH_ERROR` and retried on later scans, up to `max_upload_attempts` times
-(default 3). Runs left `UPLOAD_STARTED` or `UPLOAD_INCOMPLETE` (eg. by Ctrl+C, or a crash) are resumed the same way.
-The attempt count resets when the uploader restarts.
+### How it decides what to upload
+Nothing is stored locally about which runs have been uploaded. On each scan, the uploader:
+
+1. Finds complete runs on the sequencer: directories three levels below a sequencer's `run_output_dir`, named like
+   a run ID, with a `final_summary*.txt` file.
+2. Lists each destination server's `destination_dir` (one SSH command per destination), to see which runs are
+   there and which have an `upload_complete.json`.
+3. Uploads each run to its own sequencer's destination servers where it isn't finished:
+
+| At the destination | Meaning | What happens |
+|---|---|---|
+| `<run_id>/upload_complete.json` | Uploaded | Nothing |
+| `<run_id>/` but no `upload_complete.json` | Partly uploaded (eg. interrupted) | Upload resumed (rsync copies what's missing) |
+| No `<run_id>/` | Not uploaded | Uploaded |
+| Destination can't be listed | Unknown | Nothing, until it can be checked |
+
+Runs in the `excluded_runs_list` file (one run ID per line) are skipped. A failed upload is retried on later
+scans, up to `max_upload_attempts` times (default 3); the count resets when the uploader restarts.
+
+If `upload_history_file` is set, each upload attempt is appended to it as a CSV row (start and end times, run,
+destination, result). It's only a record for people to read: nothing uses it to decide what to upload, so it's
+safe to open, edit or delete.
 
 ### Interactive dashboard (experimental)
 ```
@@ -47,7 +54,7 @@ Logs only go to `--log-file` in this mode (stdout is used by the dashboard).
 | Key | Action |
 |-----|--------|
 | `s` | Scan now, instead of waiting for the scan interval |
-| `r` | Re-queue the selected run for upload |
+| `r` | Upload the selected run again (even if it's already uploaded) |
 | `x` | Exclude the selected run (adds it to `excluded_runs_list`) |
 | `l` | Switch the log between the activity summary and all events |
 | `q` | Quit (asks first if an upload is in progress) |
@@ -56,20 +63,6 @@ To try it with fake runs and a local "destination" (no SSH server needed):
 ```
 python scripts/generate_demo_runs.py
 test_input/demo/run-demo.sh
-```
-
-To upload one specific folder (will update status to REUPLOAD in db)
-```
-nanopore-uploader --upload-single-run 200619_M00325_0209_000000000-J6M35
-```
-
-Keep the other nanopore-uploader process running, and the file will be picked up.
-
-## Other Commands
-
-Backup database (recommended once a week)
-```
-nanopore-uploader --backup-db
 ```
 
 ## Running tests

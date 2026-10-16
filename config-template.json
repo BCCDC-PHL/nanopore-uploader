@@ -10,20 +10,20 @@
                     "server_address": "analysis.example.org",
                     "login_id": "user",
                     "id_file": "/home/user/.ssh/id_rsa",
-		    "permissions": {
-			"Du": "rwx",
+                    "permissions": {
+                        "Du": "rwx",
                         "Dg": "rx",
                         "Fu": "rw",
                         "Fg": "r",
                         "o": ""
-		    },
+                    },
                     "destination_dir": "/data/sequence/gridion/runs"
                 }
             ]
         }
     ],
     "notification": {
-	"system_config_file": "/path/to/notification/config.json",
+        "system_config_file": "/path/to/notification/config.json",
         "recipient_email_addresses": [
             "dan.fornika@bccdc.ca"
         ],
@@ -31,8 +31,6 @@
     },
     "scan_interval_seconds": 600,
     "max_upload_attempts": 3,
-    "db": {
-	"file": "/path/to/upload_db.csv"
-    },
-    "database_backups_dir": ""
+    "excluded_runs_list": "/path/to/excluded_runs.txt",
+    "upload_history_file": "/path/to/upload_history.csv"
 }

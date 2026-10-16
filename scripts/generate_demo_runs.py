@@ -11,14 +11,15 @@ Everything is written under <output-dir>/demo:
 
   data/gridion/...        GridION run output dir (complete, in-progress, excluded and badly-named runs)
   data/promethion/...     PromethION run output dir
-  destination/...         Where the runs get "uploaded" to
+  destination/...         Where the runs get "uploaded" to: one run is already uploaded there, one partly
   demo-config.json        Uploader config pointing at the above
-  uploads.csv             Upload db, with one run already marked UPLOAD_COMPLETE
   excluded_runs.txt       Excluded runs list
+  upload_history.csv      Written by the uploader as it uploads
   fake-ssh                An RSYNC_RSH stand-in that runs rsync's remote end locally (no SSH server needed),
                           and throttles it so the progress bar has something to show
   demo_site/sitecustomize.py
-                          Swaps paramiko's SSHClient for one that writes upload_complete.json locally
+                          Swaps paramiko's SSHClient for one that works locally: it lists the destination's
+                          runs and writes upload_complete.json on the local filesystem
   run-demo.sh             Starts the TUI with all of the above
 
 Usage:
@@ -27,7 +28,6 @@ Usage:
 """
 
 import argparse
-import csv
 import json
 import os
 import shutil
@@ -52,7 +52,9 @@ RUNS = [
     ("promethion", "WGS-2026-10-15", "batch-18", "20261015_0745_P2S_01234-2_PBA66666_aa11bb22", False, 8),
 ]
 
+# Runs to set up at the destination, as if earlier uploads had finished, or been interrupted part way.
 ALREADY_UPLOADED = ["20261013_1015_X1_FAZ11111_1a2b3c4d"]
+PARTLY_UPLOADED = ["20261012_1400_P2S_01234-1_PBA55555_0f1e2d3c"]
 EXCLUDED = ["20261014_0931_X4_FAZ44444_abcdef12"]
 
 FAKE_SSH = r'''#!/usr/bin/env python3
@@ -108,10 +110,12 @@ sys.exit(proc.wait())
 SITECUSTOMIZE = r'''"""
 Loaded automatically (via PYTHONPATH) by run-demo.sh, so that the uploader demo works without an SSH server.
 
-The uploader writes `upload_complete.json` to the destination with paramiko over SFTP. This replaces
-paramiko's SSHClient and key loading with stand-ins that write the file to the local filesystem.
+The uploader uses paramiko to list the runs on the destination (one shell command) and to write
+`upload_complete.json` there over SFTP. This replaces paramiko's SSHClient and key loading with stand-ins
+that run the command and write the file on the local filesystem.
 """
 import os
+import subprocess
 import warnings
 
 try:
@@ -128,8 +132,27 @@ class _LocalSFTP:
         with open(remotepath, "wb") as f:
             f.write(fl.read())
 
+    def posix_rename(self, oldpath, newpath):
+        os.replace(oldpath, newpath)
+
+    def remove(self, path):
+        os.remove(path)
+
     def close(self):
         pass
+
+
+class _LocalChannelFile:
+    def __init__(self, data, exit_status):
+        self.data = data
+        self.channel = self
+        self.exit_status = exit_status
+
+    def read(self):
+        return self.data
+
+    def recv_exit_status(self):
+        return self.exit_status
 
 
 class _LocalSSHClient:
@@ -141,6 +164,10 @@ class _LocalSSHClient:
 
     def open_sftp(self):
         return _LocalSFTP()
+
+    def exec_command(self, command, timeout=None):
+        result = subprocess.run(command, shell=True, capture_output=True)
+        return None, _LocalChannelFile(result.stdout, result.returncode), _LocalChannelFile(result.stderr, result.returncode)
 
     def close(self):
         pass
@@ -245,12 +272,16 @@ def main():
         info = sequencers[sequencer]
         make_run(info["run_output_dir"], info["instrument_id"], protocol_group_id, sample_id, run_id, complete, size_mb)
 
-    db_file = demo_dir / "uploads.csv"
-    with open(db_file, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["sequencing_run_id", "status"])
-        writer.writeheader()
-        for run_id in ALREADY_UPLOADED:
-            writer.writerow({"sequencing_run_id": run_id, "status": "UPLOAD_COMPLETE"})
+    for sequencer, protocol_group_id, sample_id, run_id, complete, size_mb in RUNS:
+        destination_run_dir = sequencers[sequencer]["destination_dir"] / run_id
+        if run_id in ALREADY_UPLOADED:
+            (destination_run_dir / "pod5").mkdir(parents=True)
+            (destination_run_dir / "upload_complete.json").write_text(json.dumps({
+                "timestamp_upload_start": "2026-10-13T12:00:00",
+                "timestamp_upload_complete": "2026-10-13T12:05:00",
+            }, indent=2) + "\n")
+        elif run_id in PARTLY_UPLOADED:
+            (destination_run_dir / "pod5").mkdir(parents=True)
 
     excluded_runs_list = demo_dir / "excluded_runs.txt"
     excluded_runs_list.write_text("".join(f"{run_id}\n" for run_id in EXCLUDED))
@@ -276,7 +307,7 @@ def main():
         ],
         "scan_interval_seconds": 60,
         "excluded_runs_list": str(excluded_runs_list),
-        "db": {"file": str(db_file)},
+        "upload_history_file": str(demo_dir / "upload_history.csv"),
     }
     (demo_dir / "demo-config.json").write_text(json.dumps(config, indent=4) + "\n")
 
