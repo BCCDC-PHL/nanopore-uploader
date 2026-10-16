@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 
@@ -219,3 +220,23 @@ def test_stop_ends_an_upload_and_marks_it_incomplete(config, run_output_dir, fak
     assert time.monotonic() - started < 10
     assert read_db(config) == {GRIDION_RUN_ID: 'UPLOAD_INCOMPLETE'}
     assert uploader.uploading_run_id is None
+
+
+def test_nothing_is_uploaded_while_the_db_is_missing(config, run_output_dir, fake_rsync, fake_ssh, uploads, caplog):
+    # eg. the db is on a network share that's gone away. Every run would look new, so don't upload anything,
+    # and don't re-create the db.
+    make_run(run_output_dir, GRIDION_RUN_ID)
+    uploader = make_uploader(config)
+    db_file = config['db']['file']
+    os.rename(db_file, db_file + '.away')
+
+    scan_once(uploader)
+
+    assert uploads() == []
+    assert not os.path.exists(db_file)
+    assert len(events(caplog, 'db_file_not_found')) == 1
+
+    os.rename(db_file + '.away', db_file)
+    scan_once(uploader)
+
+    assert uploads() == [GRIDION_RUN_ID]
