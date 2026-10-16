@@ -8,16 +8,13 @@ import threading
 
 from typing import Callable, Optional
 
+import paramiko
+
 import nanopore_uploader.core as core
-import nanopore_uploader.db as db
 from nanopore_uploader.config import load_config
 
 DEFAULT_SCAN_INTERVAL_SECONDS = 3600.0
 DEFAULT_MAX_UPLOAD_ATTEMPTS = 3
-
-# Statuses of runs whose last upload didn't finish, which are uploaded again (up to `max_upload_attempts` times).
-# UPLOAD_STARTED is left behind if the uploader was killed or lost power mid-upload.
-RETRYABLE_STATUSES = ('UPLOAD_STARTED', 'UPLOAD_INCOMPLETE', 'UPLOAD_INCOMPLETE_WITH_ERROR')
 
 log = logging.getLogger(__name__)
 
@@ -44,14 +41,18 @@ class Uploader:
     """
     The scan/upload loop.
 
+    Nothing about a run's state is stored: on each scan, each complete run is checked against its
+    sequencer's destination servers (see `core.list_remote_runs`). A run is uploaded to the destinations
+    where it's ABSENT or PARTIAL. A destination that can't be checked (UNKNOWN) is left alone.
+
     In headless mode, `run()` is called on the main thread and Ctrl+C (KeyboardInterrupt) stops it.
     In TUI mode, `run()` is called on a worker thread, and the TUI uses `scan_now()`, `requeue()`,
     `exclude()` and `stop()` to control it. Requests from the TUI are queued and carried out
-    on the worker thread between runs, so the worker is the only thing that writes to the db.
+    on the worker thread between runs.
 
-    Runs whose upload didn't finish (see `RETRYABLE_STATUSES`) are uploaded again on later scans, up to
-    `max_upload_attempts` uploads per run (default 3) since the uploader started. After that they're left
-    alone until they're re-queued, or the uploader is restarted.
+    A run whose upload fails is left PARTIAL (or ABSENT), so it's tried again on later scans, up to
+    `max_upload_attempts` uploads per run (default 3) since the uploader started. After that it's left
+    alone until it's re-queued, or the uploader is restarted.
     """
 
     def __init__(
@@ -80,6 +81,8 @@ class Uploader:
         # Uploads started for each run since the uploader started, reset when a run is uploaded or re-queued.
         self._upload_attempts: dict[str, int] = {}
         self._retries_exhausted_logged: set[str] = set()
+        # Runs re-queued to be uploaded again, even if they're already uploaded.
+        self._forced_uploads: set[str] = set()
 
     def run(self):
         """
@@ -120,58 +123,93 @@ class Uploader:
         self._handle_requests()
 
     def _scan_and_upload(self):
-        # Without the db, every run would look new and be uploaded again, so don't upload anything until it's back.
-        # (eg. it's on a network share that's gone away.) It's never re-created here: see db.check_db_file().
-        try:
-            db.check_db_file(self.config)
-        except (FileNotFoundError, ValueError) as e:
-            log.error({"event_type": "db_file_not_found", "error": str(e)})
-            return
+        # Each destination is listed at most once per scan, the first time a run needs checking against it.
+        remote_runs_by_destination: dict[tuple, Optional[dict[str, str]]] = {}
         for run in core.scan(self.config):
             if self._stop_event.is_set():
                 break
+            run_id = run['sequencing_run_id']
             log.info({
                 "event_type": "found_run",
-                "sequencing_run_id": run['sequencing_run_id'],
+                "sequencing_run_id": run_id,
                 "instrument_type": run['instrument_type'],
                 "instrument_id": run['instrument_id'],
                 "protocol_group_id": run['protocol_group_id'],
                 "run_directory": run['run_directory'],
             })
             self.config = reload_config(self.config_path, self.config)
-            if run['sequencing_run_id'] in self.config.get('excluded_runs', []):
+            if run_id in self.config.get('excluded_runs', []):
                 continue
             try:
-                run['status'] = core.check_run_status(self.config, run)
+                destinations = run['sequencer']['destination_servers']
+                destination_states = {}
+                for destination_server in destinations:
+                    remote_runs = self._remote_runs(destination_server, remote_runs_by_destination)
+                    if remote_runs is None:
+                        state = core.UNKNOWN
+                    else:
+                        state = remote_runs.get(run_id, core.ABSENT)
+                    destination_states[server_id(destination_server)] = state
+                state = core.run_state(destination_states)
                 log.debug({
-                    "event_type": "run_status_checked",
-                    "sequencing_run_id": run['sequencing_run_id'],
-                    "status": run['status'],
+                    "event_type": "run_checked",
+                    "sequencing_run_id": run_id,
+                    "state": state,
+                    "destinations": destination_states,
                 })
-                if run['status'] == 'QUEUED_FOR_UPLOAD' or (run['status'] in RETRYABLE_STATUSES and self._should_retry(run)):
+
+                if run_id in self._forced_uploads:
+                    # Re-queued: upload again to every destination that can be reached, even if it's already there.
+                    to_upload = [d for d in destinations if destination_states[server_id(d)] != core.UNKNOWN]
+                    should_upload = bool(to_upload)
+                else:
+                    to_upload = [d for d in destinations if destination_states[server_id(d)] in (core.ABSENT, core.PARTIAL)]
+                    should_upload = bool(to_upload) and self._should_upload(run_id, state)
+
+                if should_upload:
+                    self._forced_uploads.discard(run_id)
                     log.info({
                         "event_type": "upload_starting",
-                        "sequencing_run_id": run['sequencing_run_id'],
+                        "sequencing_run_id": run_id,
+                        "server_ids": [server_id(d) for d in to_upload],
                     })
-                    self._upload_run(run)
+                    self._upload_run(run, to_upload)
             # A problem with one run shouldn't stop other runs from being checked.
             except OSError as e:
                 # Expected, environmental problems (missing files, permissions, network storage).
                 # The message says what went wrong, so a traceback wouldn't add anything.
                 log.error({
                     "event_type": "upload_failed",
-                    "sequencing_run_id": run['sequencing_run_id'],
+                    "sequencing_run_id": run_id,
                     "error_type": type(e).__name__, "error": str(e)
                 })
             except Exception as e:
                 # Unexpected problems are probably bugs, so include the traceback.
                 log.error({
                     "event_type": "upload_failed",
-                    "sequencing_run_id": run['sequencing_run_id'],
+                    "sequencing_run_id": run_id,
                     "error_type": type(e).__name__,
                     "error": str(e)
                 }, exc_info=True)
             self._handle_requests()
+
+    def _remote_runs(self, destination_server: dict[str, object], cache: dict[tuple, Optional[dict[str, str]]]) -> Optional[dict[str, str]]:
+        """
+        :return: The runs on a destination (see `core.list_remote_runs`), or None if it couldn't be checked.
+        """
+        key = (destination_server.get('server_address'), destination_server.get('login_id'), destination_server.get('destination_dir'))
+        if key not in cache:
+            try:
+                cache[key] = core.list_remote_runs(destination_server)
+            except (core.RemoteListingError, OSError, paramiko.SSHException) as e:
+                log.error({
+                    "event_type": "remote_listing_failed",
+                    "server_id": server_id(destination_server),
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                })
+                cache[key] = None
+        return cache[key]
 
     def _max_upload_attempts(self) -> int:
         try:
@@ -179,18 +217,20 @@ class Uploader:
         except (TypeError, ValueError):
             return DEFAULT_MAX_UPLOAD_ATTEMPTS
 
-    def _should_retry(self, run: dict[str, object]) -> bool:
+    def _should_upload(self, run_id: str, state: str) -> bool:
         """
-        Decide whether to upload a run again, whose last upload didn't finish.
+        Decide whether to upload a run that isn't finished on its destinations, given how many times
+        it's been tried since the uploader started.
         """
-        run_id = run['sequencing_run_id']
         attempts = self._upload_attempts.get(run_id, 0)
+        if attempts == 0:
+            return True
         max_attempts = self._max_upload_attempts()
         if attempts < max_attempts:
             log.info({
                 "event_type": "upload_retrying",
                 "sequencing_run_id": run_id,
-                "previous_status": run['status'],
+                "previous_state": state,
                 "attempt": attempts + 1,
                 "max_upload_attempts": max_attempts,
             })
@@ -200,7 +240,7 @@ class Uploader:
             log.warning({
                 "event_type": "upload_retries_exhausted",
                 "sequencing_run_id": run_id,
-                "status": run['status'],
+                "state": state,
                 "attempts": attempts,
             })
         return False
@@ -214,7 +254,7 @@ class Uploader:
 
     def requeue(self, run_id: str):
         """
-        Set a run's status back to QUEUED_FOR_UPLOAD, so that it's uploaded again, and start a scan.
+        Upload a run again on the next scan (which starts now), even if it's already uploaded or has used up its attempts.
         """
         self._requests.put(('requeue', run_id))
         self._wake_event.set()
@@ -241,7 +281,7 @@ class Uploader:
 
     def stop(self):
         """
-        Stop the loop. An upload in progress is stopped and the run is marked UPLOAD_INCOMPLETE.
+        Stop the loop. An upload in progress is stopped (leaving the run PARTIAL, to be resumed later).
         Safe to call from any thread.
         """
         self._stop_event.set()
@@ -257,7 +297,7 @@ class Uploader:
             if process is not None and self._stop_event.is_set():
                 process.terminate()
 
-    def _upload_run(self, run: dict[str, object]):
+    def _upload_run(self, run: dict[str, object], destinations: list[dict[str, object]]):
         run_id = run['sequencing_run_id']
         rsync_stderr = tempfile.TemporaryFile(mode='w+') if self.capture_rsync_stderr else None
         self._uploading_run_id = run_id
@@ -266,6 +306,7 @@ class Uploader:
             status = core.upload_run(
                 self.config,
                 run,
+                destinations=destinations,
                 on_progress=self.on_progress,
                 on_process_started=self._set_rsync_process,
                 cancel_event=self._stop_event,
@@ -300,8 +341,8 @@ class Uploader:
                 return
             try:
                 if request == 'requeue':
-                    db.update_run_status_by_id(self.config, run_id, 'QUEUED_FOR_UPLOAD')
                     self._forget_attempts(run_id)
+                    self._forced_uploads.add(run_id)
                     log.info({"event_type": "run_requeued", "sequencing_run_id": run_id})
                 elif request == 'exclude':
                     self._exclude_run(run_id)
@@ -334,3 +375,10 @@ class Uploader:
                 f.write(('\n' if needs_newline else '') + run_id + '\n')
             excluded_runs.append(run_id)
         log.info({"event_type": "run_excluded", "sequencing_run_id": run_id, "excluded_runs_list": excluded_runs_list})
+
+
+def server_id(destination_server: dict[str, object]) -> str:
+    """
+    :return: The name used for a destination server in logs and the TUI.
+    """
+    return destination_server.get('server_id') or destination_server.get('server_address')

@@ -1,4 +1,3 @@
-import os
 import threading
 import time
 
@@ -7,7 +6,7 @@ import pytest
 import nanopore_uploader.core as core
 from nanopore_uploader.service import Uploader
 
-from conftest import GRIDION_RUN_ID, GRIDION_RUN_ID_2, make_run, read_db, save_config, write_db
+from conftest import GRIDION_RUN_ID, GRIDION_RUN_ID_2, make_destination, make_run, mark_partial, mark_uploaded, save_config
 
 
 def make_uploader(config, **kwargs) -> Uploader:
@@ -42,201 +41,291 @@ def uploads(fake_rsync):
     return lambda: [args[-2].rsplit('/', 1)[-1] for args in fake_rsync.calls()]
 
 
-def test_new_run_is_uploaded_once(config, run_output_dir, fake_rsync, fake_ssh, uploads):
-    make_run(run_output_dir, GRIDION_RUN_ID)
-    uploader = make_uploader(config)
+class TestWhatGetsUploaded:
+    """
+    Whether a run is uploaded depends only on what's at the destination (and the excluded runs list).
+    """
 
-    scan_once(uploader)
-    scan_once(uploader)
+    def test_new_run_is_uploaded_once(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config)
 
-    assert uploads() == [GRIDION_RUN_ID]
-    assert read_db(config) == {GRIDION_RUN_ID: 'UPLOAD_COMPLETE'}
-
-
-@pytest.mark.parametrize("previous_status", ['UPLOAD_STARTED', 'UPLOAD_INCOMPLETE', 'UPLOAD_INCOMPLETE_WITH_ERROR'])
-def test_unfinished_uploads_are_resumed(config, run_output_dir, fake_rsync, fake_ssh, uploads, previous_status, caplog):
-    # eg. UPLOAD_STARTED is what's left if the uploader crashed or lost power mid-upload.
-    make_run(run_output_dir, GRIDION_RUN_ID)
-    write_db(config, {GRIDION_RUN_ID: previous_status})
-    caplog.set_level('INFO')
-
-    scan_once(make_uploader(config))
-
-    assert uploads() == [GRIDION_RUN_ID]
-    assert read_db(config) == {GRIDION_RUN_ID: 'UPLOAD_COMPLETE'}
-    [retrying] = events(caplog, 'upload_retrying')
-    assert retrying['previous_status'] == previous_status
-
-
-def test_failed_uploads_are_retried_up_to_max_attempts(config, run_output_dir, fake_rsync, fake_ssh, uploads, monkeypatch, caplog):
-    make_run(run_output_dir, GRIDION_RUN_ID)
-    config['max_upload_attempts'] = 2
-    save_config(config)
-    monkeypatch.setenv('FAKE_RSYNC_FAIL', 'archive.example.org')
-    uploader = make_uploader(config)
-
-    for _ in range(4):
+        scan_once(uploader)
         scan_once(uploader)
 
-    assert uploads() == [GRIDION_RUN_ID] * 2
-    assert read_db(config) == {GRIDION_RUN_ID: 'UPLOAD_INCOMPLETE_WITH_ERROR'}
-    # Giving up is only logged once, not on every scan.
-    assert len(events(caplog, 'upload_retries_exhausted')) == 1
+        assert uploads() == [GRIDION_RUN_ID]
+        assert (destination_dir / GRIDION_RUN_ID / 'upload_complete.json').exists()
 
+    def test_run_already_at_the_destination_isnt_uploaded(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads, caplog):
+        # eg. uploaded by an earlier version, by hand, or before the uploader was restarted.
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+        caplog.set_level('DEBUG')
 
-def test_requeue_resets_attempts(config, run_output_dir, fake_rsync, fake_ssh, uploads, monkeypatch):
-    make_run(run_output_dir, GRIDION_RUN_ID)
-    config['max_upload_attempts'] = 2
-    save_config(config)
-    monkeypatch.setenv('FAKE_RSYNC_FAIL', 'archive.example.org')
-    uploader = make_uploader(config)
-    for _ in range(3):
+        scan_once(make_uploader(config))
+
+        assert uploads() == []
+        [checked] = events(caplog, 'run_checked')
+        assert checked['state'] == core.UPLOADED
+        assert checked['destinations'] == {'archive': core.UPLOADED}
+
+    def test_partly_uploaded_run_is_resumed(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+        # eg. the uploader crashed, lost power or was stopped mid-upload.
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_partial(destination_dir, GRIDION_RUN_ID)
+
+        scan_once(make_uploader(config))
+
+        assert uploads() == [GRIDION_RUN_ID]
+        assert (destination_dir / GRIDION_RUN_ID / 'upload_complete.json').exists()
+
+    def test_nothing_is_uploaded_if_the_destination_cant_be_checked(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads, caplog):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        destination_dir.rename(destination_dir.with_name('away'))  # eg. a share that isn't mounted
+
+        scan_once(make_uploader(config))
+
+        assert uploads() == []
+        [failed] = events(caplog, 'remote_listing_failed')
+        assert failed['server_id'] == 'archive'
+
+    def test_nothing_is_uploaded_if_the_server_cant_be_reached(self, config, run_output_dir, fake_rsync, fake_ssh, uploads, caplog):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        fake_ssh.fail = True
+
+        scan_once(make_uploader(config))
+
+        assert uploads() == []
+        assert len(events(caplog, 'remote_listing_failed')) == 1
+
+    def test_each_destination_is_listed_once_per_scan(self, config, run_output_dir, fake_rsync, fake_ssh):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        make_run(run_output_dir, GRIDION_RUN_ID_2, sample_id='sample-02')
+        uploader = make_uploader(config)
+
         scan_once(uploader)
-    assert uploads() == [GRIDION_RUN_ID] * 2  # attempts used up
-
-    uploader.requeue(GRIDION_RUN_ID)
-    for _ in range(3):
         scan_once(uploader)
 
-    # The re-queued upload, then one retry: two more attempts, as if it had just been found.
-    assert uploads() == [GRIDION_RUN_ID] * 4
+        listings = [command for command in fake_ssh.commands if 'find' in command]
+        assert len(listings) == 2
+
+    def test_no_runs_means_no_listing(self, config, fake_rsync, fake_ssh):
+        scan_once(make_uploader(config))
+
+        assert fake_ssh.commands == []
+
+    def test_excluded_run_isnt_uploaded(self, config, run_output_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        with open(config['excluded_runs_list'], 'w') as f:
+            f.write(GRIDION_RUN_ID + '\n')
+
+        scan_once(make_uploader(config))
+
+        assert uploads() == []
 
 
-def test_requeue_uploads_a_complete_run_again(config, run_output_dir, fake_rsync, fake_ssh, uploads):
-    make_run(run_output_dir, GRIDION_RUN_ID)
-    uploader = make_uploader(config)
-    scan_once(uploader)
+class TestMultipleDestinations:
+    """
+    Deployments normally have one destination server, but more than one is supported.
+    """
 
-    uploader.requeue(GRIDION_RUN_ID)
-    scan_once(uploader)
+    def test_only_uploaded_where_needed(self, config, run_output_dir, destination_dir, tmp_path, fake_rsync, fake_ssh):
+        second = make_destination(tmp_path, 'second-archive')
+        config['sequencers'][0]['destination_servers'].append(second)
+        save_config(config)
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
 
-    assert uploads() == [GRIDION_RUN_ID] * 2
+        scan_once(make_uploader(config))
 
+        assert [args[-1].split('@')[1].split('.')[0] for args in fake_rsync.calls()] == ['second-archive']
 
-def test_run_excluded_mid_scan_is_not_uploaded(config, run_output_dir, fake_rsync, fake_ssh, uploads, monkeypatch):
-    make_run(run_output_dir, GRIDION_RUN_ID)
-    make_run(run_output_dir, GRIDION_RUN_ID_2, sample_id='sample-02')
-    uploader = make_uploader(config)
-    upload_run = core.upload_run
+    def test_reachable_destinations_are_uploaded_to_when_another_cant_be_checked(self, config, run_output_dir, tmp_path, fake_rsync, fake_ssh):
+        second = make_destination(tmp_path, 'second-archive')
+        second['destination_dir'] = str(tmp_path / 'not-mounted')
+        config['sequencers'][0]['destination_servers'].append(second)
+        save_config(config)
+        make_run(run_output_dir, GRIDION_RUN_ID)
 
-    def upload_run_and_exclude_the_other_run(config, run, **kwargs):
-        # Someone excludes the other run while this one is uploading.
-        other = GRIDION_RUN_ID_2 if run['sequencing_run_id'] == GRIDION_RUN_ID else GRIDION_RUN_ID
-        uploader.exclude(other)
-        return upload_run(config, run, **kwargs)
+        scan_once(make_uploader(config))
 
-    monkeypatch.setattr(core, 'upload_run', upload_run_and_exclude_the_other_run)
-
-    scan_once(uploader)
-
-    assert len(uploads()) == 1
-    [excluded] = open(config['excluded_runs_list']).read().split()
-    assert excluded != uploads()[0]
+        assert [args[-1].split('@')[1].split('.')[0] for args in fake_rsync.calls()] == ['archive']
 
 
-def test_exclude_appends_to_excluded_runs_list(config):
-    with open(config['excluded_runs_list'], 'w') as f:
-        f.write('20261001_0000_X1_FAZ00000_00000000')  # no trailing newline
-    uploader = make_uploader(config)
+class TestRetries:
+    def test_failed_uploads_are_retried_up_to_max_attempts(self, config, run_output_dir, fake_rsync, fake_ssh, uploads, monkeypatch, caplog):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        config['max_upload_attempts'] = 2
+        save_config(config)
+        monkeypatch.setenv('FAKE_RSYNC_FAIL', 'archive.example.org')
+        caplog.set_level('INFO')
+        uploader = make_uploader(config)
 
-    uploader.exclude(GRIDION_RUN_ID)
-    uploader.exclude(GRIDION_RUN_ID)
-    uploader._handle_requests()
+        for _ in range(4):
+            scan_once(uploader)
 
-    assert open(config['excluded_runs_list']).read().splitlines() == ['20261001_0000_X1_FAZ00000_00000000', GRIDION_RUN_ID]
-    assert GRIDION_RUN_ID in uploader.config['excluded_runs']
+        assert uploads() == [GRIDION_RUN_ID] * 2
+        assert len(events(caplog, 'upload_retrying')) == 1
+        # Giving up is only logged once, not on every scan.
+        assert len(events(caplog, 'upload_retries_exhausted')) == 1
+
+    def test_attempts_reset_after_a_successful_upload(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads, monkeypatch):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        config['max_upload_attempts'] = 2
+        save_config(config)
+        uploader = make_uploader(config)
+        monkeypatch.setenv('FAKE_RSYNC_FAIL', 'archive.example.org')
+        scan_once(uploader)
+        monkeypatch.delenv('FAKE_RSYNC_FAIL')
+        scan_once(uploader)
+        assert uploader._upload_attempts == {}
+
+    def test_requeue_resets_attempts(self, config, run_output_dir, fake_rsync, fake_ssh, uploads, monkeypatch):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        config['max_upload_attempts'] = 2
+        save_config(config)
+        monkeypatch.setenv('FAKE_RSYNC_FAIL', 'archive.example.org')
+        uploader = make_uploader(config)
+        for _ in range(3):
+            scan_once(uploader)
+        assert uploads() == [GRIDION_RUN_ID] * 2  # attempts used up
+
+        uploader.requeue(GRIDION_RUN_ID)
+        for _ in range(3):
+            scan_once(uploader)
+
+        # The re-queued upload, then one retry: two more attempts, as if it had just been found.
+        assert uploads() == [GRIDION_RUN_ID] * 4
+
+    def test_requeue_uploads_an_uploaded_run_again_once(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config)
+
+        uploader.requeue(GRIDION_RUN_ID)
+        scan_once(uploader)
+        scan_once(uploader)
+
+        assert uploads() == [GRIDION_RUN_ID]
+
+    def test_requeue_waits_until_the_destination_can_be_checked(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config)
+        uploader.requeue(GRIDION_RUN_ID)
+        fake_ssh.fail = True
+        scan_once(uploader)
+        assert uploads() == []
+
+        fake_ssh.fail = False
+        scan_once(uploader)
+
+        assert uploads() == [GRIDION_RUN_ID]
 
 
-def test_exclude_without_excluded_runs_list_is_a_warning(config, caplog):
-    del config['excluded_runs_list']
-    uploader = make_uploader(config)
+class TestRequests:
+    def test_run_excluded_mid_scan_is_not_uploaded(self, config, run_output_dir, fake_rsync, fake_ssh, uploads, monkeypatch):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        make_run(run_output_dir, GRIDION_RUN_ID_2, sample_id='sample-02')
+        uploader = make_uploader(config)
+        upload_run = core.upload_run
 
-    assert not uploader.can_exclude()
-    uploader.exclude(GRIDION_RUN_ID)
-    uploader._handle_requests()
+        def upload_run_and_exclude_the_other_run(config, run, **kwargs):
+            # Someone excludes the other run while this one is uploading.
+            other = GRIDION_RUN_ID_2 if run['sequencing_run_id'] == GRIDION_RUN_ID else GRIDION_RUN_ID
+            uploader.exclude(other)
+            return upload_run(config, run, **kwargs)
 
-    assert len(events(caplog, 'exclude_failed')) == 1
+        monkeypatch.setattr(core, 'upload_run', upload_run_and_exclude_the_other_run)
 
+        scan_once(uploader)
 
-def test_exclude_is_saved_promptly_while_idle(config, caplog):
-    # Waiting for the next scan could take an hour.
-    caplog.set_level('INFO')
-    uploader = make_uploader(config)
-    thread = threading.Thread(target=uploader.run, daemon=True)
-    thread.start()
-    try:
-        wait_for(lambda: events(caplog, 'scan_complete'))
+        assert len(uploads()) == 1
+        [excluded] = open(config['excluded_runs_list']).read().split()
+        assert excluded != uploads()[0]
+
+    def test_exclude_appends_to_excluded_runs_list(self, config):
+        with open(config['excluded_runs_list'], 'w') as f:
+            f.write('20261001_0000_X1_FAZ00000_00000000')  # no trailing newline
+        uploader = make_uploader(config)
+
         uploader.exclude(GRIDION_RUN_ID)
-        wait_for(lambda: GRIDION_RUN_ID in open(config['excluded_runs_list']).read(), timeout=5)
-    finally:
+        uploader.exclude(GRIDION_RUN_ID)
+        uploader._handle_requests()
+
+        assert open(config['excluded_runs_list']).read().splitlines() == ['20261001_0000_X1_FAZ00000_00000000', GRIDION_RUN_ID]
+        assert GRIDION_RUN_ID in uploader.config['excluded_runs']
+
+    def test_exclude_without_excluded_runs_list_is_a_warning(self, config, caplog):
+        del config['excluded_runs_list']
+        uploader = make_uploader(config)
+
+        assert not uploader.can_exclude()
+        uploader.exclude(GRIDION_RUN_ID)
+        uploader._handle_requests()
+
+        assert len(events(caplog, 'exclude_failed')) == 1
+
+    def test_exclude_is_saved_promptly_while_idle(self, config, caplog):
+        # Waiting for the next scan could take an hour.
+        caplog.set_level('INFO')
+        uploader = make_uploader(config)
+        thread = threading.Thread(target=uploader.run, daemon=True)
+        thread.start()
+        try:
+            wait_for(lambda: events(caplog, 'scan_complete'))
+            uploader.exclude(GRIDION_RUN_ID)
+            wait_for(lambda: GRIDION_RUN_ID in open(config['excluded_runs_list']).read(), timeout=5)
+        finally:
+            uploader.stop()
+            thread.join(10)
+
+    def test_requests_made_just_before_stopping_are_kept(self, config):
+        uploader = make_uploader(config)
+        uploader.exclude(GRIDION_RUN_ID)
+        uploader.stop()
+
+        uploader.run()
+
+        assert open(config['excluded_runs_list']).read().split() == [GRIDION_RUN_ID]
+
+
+class TestLoop:
+    def test_scan_errors_dont_stop_the_loop(self, config, monkeypatch, caplog):
+        def broken_scan(config):
+            raise RuntimeError("scan is broken")
+            yield
+
+        monkeypatch.setattr(core, 'scan', broken_scan)
+        config['scan_interval_seconds'] = 0.01
+        uploader = make_uploader(config)
+        thread = threading.Thread(target=uploader.run, daemon=True)
+        thread.start()
+
+        try:
+            wait_for(lambda: len(events(caplog, 'scan_failed')) >= 3)
+        finally:
+            uploader.stop()
+            thread.join(10)
+
+        assert not thread.is_alive()
+        assert events(caplog, 'scan_failed')[0]['error'] == "scan is broken"
+
+    def test_stop_ends_an_upload_leaving_it_partial(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, monkeypatch):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        monkeypatch.setenv('FAKE_RSYNC_SLEEP', '30')
+        uploader = make_uploader(config)
+        thread = threading.Thread(target=uploader.run, daemon=True)
+        thread.start()
+        # Wait until rsync has started copying (it creates the run's directory first).
+        wait_for(lambda: (destination_dir / GRIDION_RUN_ID).exists())
+
+        started = time.monotonic()
         uploader.stop()
         thread.join(10)
 
-
-def test_requests_made_just_before_stopping_are_kept(config):
-    uploader = make_uploader(config)
-    uploader.exclude(GRIDION_RUN_ID)
-    uploader.stop()
-
-    uploader.run()
-
-    assert open(config['excluded_runs_list']).read().split() == [GRIDION_RUN_ID]
-
-
-def test_scan_errors_dont_stop_the_loop(config, monkeypatch, caplog):
-    def broken_scan(config):
-        raise RuntimeError("scan is broken")
-        yield
-
-    monkeypatch.setattr(core, 'scan', broken_scan)
-    config['scan_interval_seconds'] = 0.01
-    uploader = make_uploader(config)
-    thread = threading.Thread(target=uploader.run, daemon=True)
-    thread.start()
-
-    try:
-        wait_for(lambda: len(events(caplog, 'scan_failed')) >= 3)
-    finally:
-        uploader.stop()
-        thread.join(10)
-
-    assert not thread.is_alive()
-    assert events(caplog, 'scan_failed')[0]['error'] == "scan is broken"
-
-
-def test_stop_ends_an_upload_and_marks_it_incomplete(config, run_output_dir, fake_rsync, fake_ssh, monkeypatch):
-    make_run(run_output_dir, GRIDION_RUN_ID)
-    monkeypatch.setenv('FAKE_RSYNC_SLEEP', '30')
-    uploader = make_uploader(config)
-    thread = threading.Thread(target=uploader.run, daemon=True)
-    thread.start()
-    wait_for(lambda: uploader._rsync_process is not None)
-
-    started = time.monotonic()
-    uploader.stop()
-    thread.join(10)
-
-    assert not thread.is_alive()
-    assert time.monotonic() - started < 10
-    assert read_db(config) == {GRIDION_RUN_ID: 'UPLOAD_INCOMPLETE'}
-    assert uploader.uploading_run_id is None
-
-
-def test_nothing_is_uploaded_while_the_db_is_missing(config, run_output_dir, fake_rsync, fake_ssh, uploads, caplog):
-    # eg. the db is on a network share that's gone away. Every run would look new, so don't upload anything,
-    # and don't re-create the db.
-    make_run(run_output_dir, GRIDION_RUN_ID)
-    uploader = make_uploader(config)
-    db_file = config['db']['file']
-    os.rename(db_file, db_file + '.away')
-
-    scan_once(uploader)
-
-    assert uploads() == []
-    assert not os.path.exists(db_file)
-    assert len(events(caplog, 'db_file_not_found')) == 1
-
-    os.rename(db_file + '.away', db_file)
-    scan_once(uploader)
-
-    assert uploads() == [GRIDION_RUN_ID]
+        assert not thread.is_alive()
+        assert time.monotonic() - started < 10
+        assert uploader.uploading_run_id is None
+        # Left partly uploaded, so it's resumed next time.
+        assert core.list_remote_runs(config['sequencers'][0]['destination_servers'][0]) == {GRIDION_RUN_ID: core.PARTIAL}

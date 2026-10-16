@@ -5,9 +5,9 @@ Uploads run against a fake `rsync` (put first on PATH) and a fake paramiko SSH c
 need neither a network nor an SSH server. The fake rsync's behaviour is controlled with environment
 variables (see FAKE_RSYNC below), which the real `subprocess.Popen` call passes on to it.
 """
-import csv
 import json
 import os
+import subprocess
 import sys
 import textwrap
 
@@ -29,6 +29,9 @@ FAKE_RSYNC = textwrap.dedent('''\
       FAKE_RSYNC_EXIT_CODE  Exit code for failures (default 23).
       FAKE_RSYNC_GARBAGE    If set, also print lines that aren't progress updates.
       FAKE_RSYNC_SLEEP      Seconds to wait before exiting (so the upload can be stopped).
+
+    Like rsync, it creates the run's directory at the destination (a local path, in the tests) before copying
+    anything, so an upload that fails or is stopped leaves the run partly uploaded. It doesn't copy any files.
     """
     import json, os, sys, time
 
@@ -37,7 +40,9 @@ FAKE_RSYNC = textwrap.dedent('''\
         with open(os.environ["FAKE_RSYNC_LOG"], "a") as f:
             f.write(json.dumps(args) + "\\n")
 
-    destination = args[-1]
+    source, destination = args[-2], args[-1]
+    destination_dir = destination.split(":", 1)[1]
+    os.makedirs(os.path.join(destination_dir, os.path.basename(source)), exist_ok=True)
     if os.environ.get("FAKE_RSYNC_GARBAGE"):
         print("sending incremental file list", flush=True)
         print("some/file.pod5", flush=True)
@@ -77,22 +82,6 @@ def make_run(run_output_dir: Path, run_id: str, complete: bool = True, protocol_
     return run_dir
 
 
-def read_db(config: dict) -> dict[str, str]:
-    """
-    :return: The upload db, as {sequencing_run_id: status}.
-    """
-    with open(config['db']['file'], newline='') as f:
-        return {row['sequencing_run_id']: row['status'] for row in csv.DictReader(f)}
-
-
-def write_db(config: dict, statuses: dict[str, str]):
-    with open(config['db']['file'], 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['sequencing_run_id', 'status'])
-        writer.writeheader()
-        for run_id, status in statuses.items():
-            writer.writerow({'sequencing_run_id': run_id, 'status': status})
-
-
 def make_destination(tmp_path: Path, server_id: str) -> dict:
     destination_dir = tmp_path / "destinations" / server_id
     destination_dir.mkdir(parents=True)
@@ -109,8 +98,8 @@ def make_destination(tmp_path: Path, server_id: str) -> dict:
 @pytest.fixture
 def config(tmp_path: Path) -> dict:
     """
-    A config with one GridION sequencer and one destination server (the usual deployment), an empty
-    upload db and an excluded runs list. It's also written to `config['_path']`, for the Uploader to reload.
+    A config with one GridION sequencer and one destination server (the usual deployment), an excluded
+    runs list and an upload history file. It's also written to `config['_path']`, for the Uploader to reload.
     """
     run_output_dir = tmp_path / "runs" / "gridion"
     run_output_dir.mkdir(parents=True)
@@ -128,9 +117,8 @@ def config(tmp_path: Path) -> dict:
         "scan_interval_seconds": 3600,
         "excluded_runs_list": str(excluded_runs_list),
         "excluded_runs": [],
-        "db": {"file": str(tmp_path / "uploads.csv")},
+        "upload_history_file": str(tmp_path / "upload_history.csv"),
     }
-    write_db(config, {})
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({k: v for k, v in config.items() if k != 'excluded_runs'}, indent=2))
     config['_path'] = str(config_path)
@@ -148,6 +136,29 @@ def save_config(config: dict):
 @pytest.fixture
 def run_output_dir(config) -> Path:
     return Path(config['sequencers'][0]['run_output_dir'])
+
+
+@pytest.fixture
+def destination_dir(config) -> Path:
+    """
+    The (local) destination directory of the config's one destination server.
+    """
+    return Path(config['sequencers'][0]['destination_servers'][0]['destination_dir'])
+
+
+def mark_uploaded(destination_dir: Path, run_id: str):
+    """
+    Make a run look finished on a destination, as if an earlier upload completed.
+    """
+    (destination_dir / run_id).mkdir(parents=True, exist_ok=True)
+    (destination_dir / run_id / core.UPLOAD_COMPLETE_FILENAME).write_text("{}\n")
+
+
+def mark_partial(destination_dir: Path, run_id: str):
+    """
+    Make a run look partly uploaded on a destination, as if an earlier upload was interrupted.
+    """
+    (destination_dir / run_id / "pod5").mkdir(parents=True, exist_ok=True)
 
 
 @pytest.fixture
@@ -183,19 +194,37 @@ def fake_rsync(tmp_path: Path, monkeypatch):
 @pytest.fixture
 def fake_ssh(monkeypatch):
     """
-    Replace paramiko's SSH client with one that writes `upload_complete.json` to the local filesystem.
+    Replace paramiko's SSH client with one that works on the local filesystem: commands (the remote runs
+    listing) run locally, and `upload_complete.json` is written to the local destination directory.
 
-    Set `fake_ssh.fail = True` to make connecting fail.
+    Set `fake_ssh.fail = True` to make connecting fail, or `fake_ssh.fail_sftp = True` to make only writing
+    `upload_complete.json` fail. `fake_ssh.commands` has the commands run so far.
     """
     class FakeSSH:
         def __init__(self):
             self.fail = False
+            self.fail_sftp = False
             self.written: list[str] = []
+            self.commands: list[str] = []
 
     state = FakeSSH()
 
+    class ChannelFile:
+        def __init__(self, data: bytes, exit_status: int):
+            self.data = data
+            self.channel = self
+            self.exit_status = exit_status
+
+        def read(self) -> bytes:
+            return self.data
+
+        def recv_exit_status(self) -> int:
+            return self.exit_status
+
     class LocalSFTP:
         def putfo(self, fl, remotepath):
+            if state.fail_sftp:
+                raise OSError("Permission denied (fake)")
             os.makedirs(os.path.dirname(remotepath), exist_ok=True)
             with open(remotepath, "wb") as f:
                 f.write(fl.read())
@@ -216,6 +245,11 @@ def fake_ssh(monkeypatch):
 
         def open_sftp(self):
             return LocalSFTP()
+
+        def exec_command(self, command):
+            state.commands.append(command)
+            result = subprocess.run(command, shell=True, capture_output=True)
+            return None, ChannelFile(result.stdout, result.returncode), ChannelFile(result.stderr, result.returncode)
 
         def close(self):
             self.closed = True

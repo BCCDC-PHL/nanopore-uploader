@@ -1,3 +1,4 @@
+import csv
 import json
 import threading
 
@@ -5,22 +6,19 @@ import pytest
 
 import nanopore_uploader.core as core
 
-from conftest import GRIDION_RUN_ID, make_destination, make_run, read_db, write_db
+from conftest import GRIDION_RUN_ID, make_destination, make_run
 
 
 @pytest.fixture
 def run(config, run_output_dir) -> dict:
-    run_dir = make_run(run_output_dir, GRIDION_RUN_ID)
-    run = {
-        "sequencing_run_id": GRIDION_RUN_ID,
-        "protocol_group_id": "PG-01",
-        "instrument_type": "GRIDION",
-        "instrument_id": "GXB03493",
-        "run_directory": str(run_dir),
-        "status": "QUEUED_FOR_UPLOAD",
-    }
-    write_db(config, {GRIDION_RUN_ID: "QUEUED_FOR_UPLOAD"})
+    make_run(run_output_dir, GRIDION_RUN_ID)
+    [run] = core.find_runs(config)
     return run
+
+
+def history(config) -> list[dict]:
+    with open(config["upload_history_file"], newline='') as f:
+        return list(csv.DictReader(f))
 
 
 def add_second_destination(config, tmp_path) -> dict:
@@ -39,17 +37,15 @@ def test_describe_rsync_returncode(returncode, expected):
     assert core.describe_rsync_returncode(returncode) == expected
 
 
-def test_successful_upload(config, run, fake_rsync, fake_ssh):
+def test_successful_upload(config, run, destination_dir, fake_rsync, fake_ssh):
     progress = []
 
     status = core.upload_run(config, run, on_progress=progress.append)
 
     assert status == "UPLOAD_COMPLETE"
-    assert read_db(config) == {GRIDION_RUN_ID: "UPLOAD_COMPLETE"}
     # upload_complete.json is written in the run's directory on the destination.
-    destination_dir = config["sequencers"][0]["destination_servers"][0]["destination_dir"]
-    marker = f"{destination_dir}/{GRIDION_RUN_ID}/upload_complete.json"
-    assert fake_ssh.written == [marker]
+    marker = destination_dir / GRIDION_RUN_ID / "upload_complete.json"
+    assert fake_ssh.written == [str(marker)]
     assert set(json.load(open(marker))) == {"timestamp_upload_start", "timestamp_upload_complete"}
     # Every progress update is passed on, not just the logged milestones.
     assert [p["percent_complete"] for p in progress] == [25.0, 50.0, 75.0, 100.0]
@@ -57,14 +53,14 @@ def test_successful_upload(config, run, fake_rsync, fake_ssh):
     assert progress[-1]["upload_speed"] == "10.00MB/s"
 
 
-def test_rsync_command(config, run, fake_rsync, fake_ssh):
+def test_rsync_command(config, run, destination_dir, fake_rsync, fake_ssh):
     config["sequencers"][0]["excluded_run_contents"] = ["*.fast5", "other_reports"]
+    [run] = core.find_runs(config)
 
     core.upload_run(config, run)
 
     [args] = fake_rsync.calls()
-    destination = config["sequencers"][0]["destination_servers"][0]
-    assert args[-2:] == [run["run_directory"], f"uploader@archive.example.org:{destination['destination_dir']}"]
+    assert args[-2:] == [run["run_directory"], f"uploader@archive.example.org:{destination_dir}"]
     assert "--chmod=Du=rwx,Dg=rx,Fu=rw,Fg=r,o=" in args
     assert args[args.index("--exclude") + 1] == "*.fast5"
     assert args.count("--exclude") == 2
@@ -81,26 +77,24 @@ def test_upload_logs_complete_once(config, run, fake_rsync, fake_ssh, caplog):
     assert "upload_failed" not in events
 
 
-def test_rsync_failure_marks_run_incomplete_with_error(config, run, fake_rsync, fake_ssh, monkeypatch, caplog):
+def test_rsync_failure(config, run, fake_rsync, fake_ssh, monkeypatch, caplog):
     monkeypatch.setenv("FAKE_RSYNC_FAIL", "archive.example.org")
     monkeypatch.setenv("FAKE_RSYNC_EXIT_CODE", "255")
 
     status = core.upload_run(config, run)
 
     assert status == "UPLOAD_INCOMPLETE_WITH_ERROR"
-    assert read_db(config) == {GRIDION_RUN_ID: "UPLOAD_INCOMPLETE_WITH_ERROR"}
     assert fake_ssh.written == []
     [failed] = [r.msg for r in caplog.records if isinstance(r.msg, dict) and r.msg.get("event_type") == "upload_failed"]
     assert failed["error"] == "archive: rsync exited with code 255 (SSH connection failed)"
 
 
-def test_upload_complete_file_failure_marks_run_incomplete_with_error(config, run, fake_rsync, fake_ssh):
-    fake_ssh.fail = True
+def test_upload_complete_file_failure(config, run, fake_rsync, fake_ssh):
+    fake_ssh.fail_sftp = True
 
     status = core.upload_run(config, run)
 
     assert status == "UPLOAD_INCOMPLETE_WITH_ERROR"
-    assert read_db(config) == {GRIDION_RUN_ID: "UPLOAD_INCOMPLETE_WITH_ERROR"}
 
 
 def test_unexpected_rsync_output_is_ignored(config, run, fake_rsync, fake_ssh, monkeypatch):
@@ -127,7 +121,7 @@ def test_rsync_is_stopped_if_reading_its_output_fails(config, run, fake_rsync, f
     assert process.poll() is not None
 
 
-def test_cancelled_upload_marks_run_incomplete(config, run, fake_rsync, fake_ssh, monkeypatch):
+def test_cancelled_upload(config, run, fake_rsync, fake_ssh, monkeypatch):
     monkeypatch.setenv("FAKE_RSYNC_SLEEP", "30")
     cancel_event = threading.Event()
 
@@ -138,17 +132,91 @@ def test_cancelled_upload_marks_run_incomplete(config, run, fake_rsync, fake_ssh
     status = core.upload_run(config, run, on_process_started=cancel, cancel_event=cancel_event)
 
     assert status == "UPLOAD_INCOMPLETE"
-    assert read_db(config) == {GRIDION_RUN_ID: "UPLOAD_INCOMPLETE"}
     assert fake_ssh.written == []
 
 
-class TestMultipleDestinations:
-    """
-    Deployments normally have one destination server, but more than one is supported.
-    """
+class TestHistory:
+    def test_successful_upload_is_recorded(self, config, run, fake_rsync, fake_ssh):
+        core.upload_run(config, run)
+
+        [row] = history(config)
+        assert row["sequencing_run_id"] == GRIDION_RUN_ID
+        assert row["instrument_id"] == "GXB03493"
+        assert row["server_id"] == "archive"
+        assert row["result"] == "complete"
+        assert row["detail"] == ""
+        assert row["timestamp_start"] <= row["timestamp_end"]
+
+    def test_failed_upload_is_recorded(self, config, run, fake_rsync, fake_ssh, monkeypatch):
+        monkeypatch.setenv("FAKE_RSYNC_FAIL", "archive.example.org")
+
+        core.upload_run(config, run)
+
+        [row] = history(config)
+        assert row["result"] == "failed"
+        assert row["detail"] == "rsync exited with code 23 (partial transfer due to error)"
+
+    def test_cancelled_upload_is_recorded(self, config, run, fake_rsync, fake_ssh, monkeypatch):
+        monkeypatch.setenv("FAKE_RSYNC_SLEEP", "30")
+        cancel_event = threading.Event()
+
+        def cancel(process):
+            cancel_event.set()
+            process.terminate()
+
+        core.upload_run(config, run, on_process_started=cancel, cancel_event=cancel_event)
+
+        assert [row["result"] for row in history(config)] == ["cancelled"]
+
+    def test_rows_are_appended(self, config, run, fake_rsync, fake_ssh):
+        core.upload_run(config, run)
+        core.upload_run(config, run)
+
+        assert [row["result"] for row in history(config)] == ["complete", "complete"]
+
+    def test_history_is_optional(self, config, run, fake_rsync, fake_ssh, tmp_path):
+        del config["upload_history_file"]
+
+        assert core.upload_run(config, run) == "UPLOAD_COMPLETE"
+
+    def test_history_write_errors_dont_stop_uploads(self, config, run, fake_rsync, fake_ssh, tmp_path, caplog):
+        config["upload_history_file"] = str(tmp_path / "missing-dir" / "upload_history.csv")
+
+        status = core.upload_run(config, run)
+
+        assert status == "UPLOAD_COMPLETE"
+        failures = [r.msg for r in caplog.records if isinstance(r.msg, dict) and r.msg.get("event_type") == "upload_history_write_failed"]
+        assert len(failures) == 1
+
+
+class TestDestinations:
+    def test_only_the_runs_own_sequencers_destinations_are_used(self, config, run, fake_rsync, fake_ssh, tmp_path):
+        # Issue #4: runs used to be uploaded to every sequencer's destinations.
+        other_sequencer_output_dir = tmp_path / "runs" / "promethion"
+        other_sequencer_output_dir.mkdir(parents=True)
+        config["sequencers"].append({
+            "instrument_id": "P2S-01234",
+            "instrument_type": "promethion",
+            "run_output_dir": str(other_sequencer_output_dir),
+            "destination_servers": [make_destination(tmp_path, "promethion-archive")],
+        })
+
+        core.upload_run(config, run)
+
+        assert [args[-1].split("@")[1].split(".")[0] for args in fake_rsync.calls()] == ["archive"]
+
+    def test_only_the_given_destinations_are_used(self, config, run, fake_rsync, fake_ssh, tmp_path):
+        second = add_second_destination(config, tmp_path)
+        [run] = core.find_runs(config)
+
+        core.upload_run(config, run, destinations=[second])
+
+        assert [args[-1].split("@")[1].split(".")[0] for args in fake_rsync.calls()] == ["second-archive"]
 
     def test_uploaded_to_every_destination(self, config, run, fake_rsync, fake_ssh, tmp_path, caplog):
+        # Deployments normally have one destination server, but more than one is supported.
         add_second_destination(config, tmp_path)
+        [run] = core.find_runs(config)
         caplog.set_level("INFO")
 
         status = core.upload_run(config, run)
@@ -162,6 +230,7 @@ class TestMultipleDestinations:
 
     def test_one_failure_doesnt_stop_the_others(self, config, run, fake_rsync, fake_ssh, tmp_path, monkeypatch):
         add_second_destination(config, tmp_path)
+        [run] = core.find_runs(config)
         # Fail the first destination ("archive.example.org"), but not "second-archive.example.org".
         monkeypatch.setenv("FAKE_RSYNC_FAIL", "@archive.example.org")
 
@@ -170,3 +239,4 @@ class TestMultipleDestinations:
         assert status == "UPLOAD_INCOMPLETE_WITH_ERROR"
         assert len(fake_rsync.calls()) == 2
         assert [path.split("/destinations/")[1] for path in fake_ssh.written] == [f"second-archive/{GRIDION_RUN_ID}/upload_complete.json"]
+        assert [row["result"] for row in history(config)] == ["failed", "complete"]

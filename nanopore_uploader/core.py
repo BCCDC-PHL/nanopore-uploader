@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -18,12 +19,23 @@ import paramiko
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, Optional
 
-import nanopore_uploader.db as db
+import nanopore_uploader.history as history
 
 log = logging.getLogger(__name__)
 
 GRIDION_RUN_ID_REGEX = r"\d{8}_\d{4}_X[1-5]_[A-Z0-9]+_[a-f0-9]{8}"
 PROMETHION_RUN_ID_REGEX = r"\d{8}_\d{4}_P2S_[0-9\-]+_[A-Z0-9]+_[a-f0-9]{8}"
+
+UPLOAD_COMPLETE_FILENAME = 'upload_complete.json'
+
+# Where a run is at on a destination server. Worked out on every scan from the destination itself:
+# `upload_complete.json` there is the record of a finished upload (it's what downstream automation looks for).
+UPLOADED = 'UPLOADED'   # <destination_dir>/<run_id>/upload_complete.json exists
+PARTIAL = 'PARTIAL'     # <destination_dir>/<run_id>/ exists, but not upload_complete.json (an interrupted or failed upload)
+ABSENT = 'ABSENT'       # <destination_dir>/<run_id>/ doesn't exist
+UNKNOWN = 'UNKNOWN'     # The destination couldn't be checked (eg. unreachable). Nothing is uploaded to it.
+
+SSH_CONNECT_TIMEOUT_SECONDS = 30
 
 def parse_final_summary(final_summary_file: os.PathLike) -> dict[str, str]:
     """
@@ -47,8 +59,8 @@ def check_candidate_run_dir(sequencer: dict[str, object], candidate_run_dir: str
 
     :param sequencer: Config for the sequencer whose output directory the candidate was found in.
     :param candidate_run_dir: Directory to check.
-    :return: The run (keys: `["sequencing_run_id", "protocol_group_id", "instrument_type", "instrument_id", "run_directory"]`),
-             or None if it isn't a complete run.
+    :return: The run (keys: `["sequencing_run_id", "protocol_group_id", "instrument_type", "instrument_id", "run_directory", "sequencer"]`),
+             or None if it isn't a complete run. `sequencer` is the sequencer's config, which says where its runs are uploaded to.
     """
     candidate_run_dir = os.path.abspath(PurePosixPath(candidate_run_dir))
     run_id = os.path.basename(candidate_run_dir)
@@ -83,6 +95,7 @@ def check_candidate_run_dir(sequencer: dict[str, object], candidate_run_dir: str
         "instrument_type": sequencer.get('instrument_type', None).upper(),
         "instrument_id": sequencer.get('instrument_id', None),
         "run_directory": candidate_run_dir,
+        "sequencer": sequencer,
     }
 
 
@@ -96,8 +109,8 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
 
     :param config: Application config
     :type config: dict[str, object]
-    :return: List of keys: `["sequencing_run_id", "protocol_group_id", "instrument_type", "instrument_id", "run_directory"]`
-    :rtype: list[dict[str, str]]
+    :return: List of runs (see `check_candidate_run_dir`).
+    :rtype: list[dict[str, object]]
     """
     runs = []
     for sequencer in config['sequencers']:
@@ -133,105 +146,131 @@ def find_runs(config: dict[str, object]) -> list[dict[str, str]]:
     return runs
 
 
-def find_remote_runs(config: dict[str, object]) -> list[dict[str, object]]:
+class RemoteListingError(Exception):
     """
-    Check the remote destination server to see which runs have already been uploaded.
+    The runs on a destination server couldn't be listed.
+    """
 
-    :param config: Application config.
-    :type config: dict[str, object]
-    :return: List of runs on the remote destination servers. Keys: `["sequencing_run_id", "run_directory", "status"]
-    :rtype: list[dict[stry, object]]
+
+def connect(destination_server: dict[str, object]) -> paramiko.SSHClient:
+    """
+    Open an SSH connection to a destination server. The caller must close it.
+
+    :param destination_server: Config for the destination server.
+    :return: The connected client.
     """
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy( paramiko.AutoAddPolicy() )
-    remote_runs = []
-    for sequencer in config['sequencers']:
-        for destination_server in sequencer['destination_servers']:
-            server_address = destination_server['server_address']
-            log.info({"event_type": "connecting_to_remote_server", "server_address": server_address})
-            rsa_key = paramiko.RSAKey.from_private_key_file(destination_server['id_file'])
-            username = destination_server['login_id']
-            destination_dir = destination_server['destination_dir']
-            ssh.connect(server_address, username=username, pkey=rsa_key)
-            log.info({"event_type": "connected_to_remote_server", "server_address": server_address})
-            list_run_dirs_cmd = [
-                'ls',
-                '-1d',
-                str(PurePosixPath(destination_dir) / '*'),
-            ]
-            stdin, stdout, stderr = ssh.exec_command(' '.join(list_run_dirs_cmd))
-            log.debug({"event_type": "executed_remote_command", "command": ' '.join(list_run_dirs_cmd)})
-            candidate_remote_run_dirs = [x.strip() for x in stdout.readlines()]
-            log.info({
-                "event_type": "found_remote_run_directories", 
-                "num_candidate_remote_run_dirs": len(candidate_remote_run_dirs)
-            })
+    try:
+        ssh.set_missing_host_key_policy( paramiko.AutoAddPolicy() )
+        rsa_key = paramiko.RSAKey.from_private_key_file(destination_server['id_file'])
+        ssh.connect(
+            destination_server['server_address'],
+            username=destination_server['login_id'],
+            pkey=rsa_key,
+            timeout=SSH_CONNECT_TIMEOUT_SECONDS,
+        )
+    except BaseException:
+        ssh.close()
+        raise
+    return ssh
 
-            for candidate_remote_run_dir in candidate_remote_run_dirs:
-                candidate_run_id = os.path.basename(candidate_remote_run_dir)
-                if re.match(GRIDION_RUN_ID_REGEX, candidate_run_id) or re.match(PROMETHION_RUN_ID_REGEX, candidate_run_id):
-                    list_upload_complete_file_cmd = [
-                        'ls',
-                        '-1d',
-                        str(PurePosixPath(candidate_remote_run_dir) / 'upload_complete.json')
-                    ]
-                    stdin, stdout, stderr = ssh.exec_command(' '.join(list_upload_complete_file_cmd))
-                    log.debug({"event_type": "executed_remote_command", "command": ' '.join(list_upload_complete_file_cmd)})
-                    if len(stdout.readlines()) > 0:
-                        upload_status = "UPLOAD_COMPLETE"
-                    else:
-                        upload_status = "UPLOAD_INCOMPLETE"
-                    remote_run = {
-                        'sequencing_run_id': candidate_run_id,
-                        'run_directory': candidate_remote_run_dir,
-                        'status' : upload_status
-                    }
-                    remote_runs.append(remote_run)
 
-            log.info({
-                "event_type": "remote_runs_processed",
-                "num_remote_runs": len(remote_runs)
-            })
+def list_remote_runs_command(destination_dir: str) -> str:
+    """
+    The shell command that lists a destination's run directories and `upload_complete.json` files.
 
+    It prints one path per line, relative to the destination dir: `./<run_id>` for each directory directly
+    inside it, and `./<run_id>/upload_complete.json` for each completed upload. One command (rather than one
+    per run) keeps a scan to a single round trip, however many runs the destination has.
+    """
+    return (
+        f"cd {shlex.quote(destination_dir)} && "
+        f"find . -mindepth 1 -maxdepth 2 "
+        f"\\( -path './*/*' -name {UPLOAD_COMPLETE_FILENAME} -o ! -path './*/*' -type d \\)"
+    )
+
+
+def parse_remote_runs_listing(listing: str) -> dict[str, str]:
+    """
+    Parse the output of `list_remote_runs_command`.
+
+    :param listing: The command's output.
+    :return: {run_id: UPLOADED or PARTIAL} for each directory that looks like a run (others are ignored).
+    """
+    remote_runs = {}
+    for line in listing.splitlines():
+        parts = line.strip().removeprefix('./').split('/')
+        run_id = parts[0]
+        if not (re.fullmatch(GRIDION_RUN_ID_REGEX, run_id) or re.fullmatch(PROMETHION_RUN_ID_REGEX, run_id)):
+            continue
+        if len(parts) == 1:
+            remote_runs.setdefault(run_id, PARTIAL)
+        elif parts[1:] == [UPLOAD_COMPLETE_FILENAME]:
+            remote_runs[run_id] = UPLOADED
     return remote_runs
 
 
-def scan(config: dict[str, object]) -> Iterator[Optional[dict[str, object]]]:
+def list_remote_runs(destination_server: dict[str, object]) -> dict[str, str]:
     """
-    Scan for sequencing runs and update their status based on remote runs.
+    Find which runs are on a destination server, and which of them finished uploading.
+
+    :param destination_server: Config for the destination server.
+    :return: {run_id: UPLOADED or PARTIAL}. Runs that aren't there are ABSENT.
+    :raises RemoteListingError: If the listing command fails (eg. the destination dir is missing or unreadable).
+        Then the destination's state is unknown, and nothing should be uploaded to it.
+    :raises OSError, paramiko.SSHException: If the server can't be reached.
+    """
+    command = list_remote_runs_command(destination_server['destination_dir'])
+    ssh = connect(destination_server)
+    try:
+        stdin, stdout, stderr = ssh.exec_command(command)
+        listing = stdout.read().decode(errors='replace')
+        errors = stderr.read().decode(errors='replace').strip()
+        exit_status = stdout.channel.recv_exit_status()
+    finally:
+        ssh.close()
+    if exit_status != 0:
+        raise RemoteListingError(errors or f"listing {destination_server['destination_dir']} failed with exit status {exit_status}")
+    remote_runs = parse_remote_runs_listing(listing)
+    log.info({
+        "event_type": "remote_runs_listed",
+        "server_id": destination_server.get('server_id'),
+        "num_remote_runs": len(remote_runs),
+        "num_uploaded": sum(1 for state in remote_runs.values() if state == UPLOADED),
+    })
+    return remote_runs
+
+
+def run_state(destination_states: dict[str, str]) -> str:
+    """
+    Combine a run's state on each of its destinations into one state for the run.
+
+    :param destination_states: {server_id: UPLOADED, PARTIAL, ABSENT or UNKNOWN}
+    :return: PARTIAL or ABSENT if the run still needs uploading somewhere (PARTIAL if any destination has
+             part of it), UPLOADED if it's finished on every destination, otherwise UNKNOWN.
+    """
+    states = set(destination_states.values())
+    if PARTIAL in states:
+        return PARTIAL
+    if ABSENT in states:
+        return ABSENT
+    if states == {UPLOADED}:
+        return UPLOADED
+    return UNKNOWN
+
+
+def scan(config: dict[str, object]) -> Iterator[dict[str, object]]:
+    """
+    Find complete sequencing runs, leaving out excluded runs.
 
     :param config: Application config.
     :type config: dict[str, object]
-    :param remote_runs: List of remote runs with their status.
-    :type remote_runs: list[dict[str, object]]
-    :return: Iterator of sequencing runs with updated status.
-    :rtype: Iterator[Optional[dict[str, object]]]
+    :return: Iterator of sequencing runs (see `check_candidate_run_dir`).
+    :rtype: Iterator[dict[str, object]]
     """
     for run in find_runs(config):
         if run['sequencing_run_id'] not in config.get('excluded_runs', []):
             yield run
-
-
-def check_run_status(config: dict[str, object], run: dict[str, object]):
-    """
-    
-    :param config: Application config.
-    :type config: dict[str, object]
-    :param run: Sequencing run.
-    :type run: dict[str, object]
-    :return: Run status
-    :rtype: str
-    """
-    existing_run = db.get_run_by_id(config, run['sequencing_run_id'])
-    if existing_run is not None:
-        run_status = existing_run['status']
-    else:
-        run_status = 'QUEUED_FOR_UPLOAD'
-        run['status'] = run_status
-        db.store_run(config, run)
-
-    return run_status
-
 
 
 # Exit codes from the rsync man page that are most likely to come up, to make errors easier to act on.
@@ -398,16 +437,11 @@ def write_upload_complete_file(destination_server: dict[str, object], run_id: st
         "timestamp_upload_start": timestamp_upload_start,
         "timestamp_upload_complete": timestamp_upload_complete,
     }
-    ssh = paramiko.SSHClient()
+    ssh = connect(destination_server)
     try:
-        ssh.set_missing_host_key_policy( paramiko.AutoAddPolicy() )
-        rsa_key = paramiko.RSAKey.from_private_key_file(destination_server['id_file'])
-        server_address = destination_server['server_address']
-        username = destination_server['login_id']
-        ssh.connect(server_address, username=username, pkey=rsa_key)
         ftp = ssh.open_sftp()
         try:
-            upload_complete_destination_path = os.path.join(destination_server['destination_dir'], run_id, 'upload_complete.json')
+            upload_complete_destination_path = os.path.join(destination_server['destination_dir'], run_id, UPLOAD_COMPLETE_FILENAME)
             upload_complete_file_contents = json.dumps(upload_complete, indent=2) + '\n'
             ftp.putfo(io.BytesIO(upload_complete_file_contents.encode()), upload_complete_destination_path)
         finally:
@@ -424,83 +458,99 @@ def write_upload_complete_file(destination_server: dict[str, object], run_id: st
 def upload_run(
         config: dict[str, object],
         run: dict[str, object],
+        destinations: Optional[list[dict[str, object]]] = None,
         on_progress: Optional[Callable[[dict[str, object]], None]] = None,
         on_process_started: Optional[Callable[[subprocess.Popen], None]] = None,
         cancel_event: Optional[threading.Event] = None,
         rsync_stderr=None,
 ) -> str:
     """
-    Upload a run to each destination server.
+    Upload a run to destination servers, writing an `upload_complete.json` file on each once it's copied.
 
-    The run is marked UPLOAD_COMPLETE only once it has been copied to every destination server, and an
-    `upload_complete.json` file written on each. If any destination fails, the others are still attempted,
-    and the run is marked UPLOAD_INCOMPLETE_WITH_ERROR.
+    If one destination fails, the others are still attempted. Each attempt is recorded in the upload history
+    file, if one is configured.
 
     :param config: Application config.
     :type config: dict[str, object]
-    :param run: Sequencing run
+    :param run: Sequencing run (see `check_candidate_run_dir`).
     :type run: dict[str, object]
+    :param destinations: Destination servers to upload to. Default: all of the run's sequencer's destinations.
     :param on_progress: Called with every rsync progress update (not just the logged milestones).
     :param on_process_started: Called with each rsync process when it starts, so that it can be stopped from another thread.
-    :param cancel_event: If this is set when rsync exits, the upload was stopped deliberately: mark the run UPLOAD_INCOMPLETE and stop.
+    :param cancel_event: If this is set when rsync exits, the upload was stopped deliberately: stop without trying other destinations.
     :param rsync_stderr: Where rsync's stderr goes (passed to `subprocess.Popen`). Default: inherited from this process.
-    :return: The run's new status: UPLOAD_COMPLETE, UPLOAD_INCOMPLETE (cancelled) or UPLOAD_INCOMPLETE_WITH_ERROR.
+    :return: UPLOAD_COMPLETE (every destination succeeded), UPLOAD_INCOMPLETE (cancelled)
+             or UPLOAD_INCOMPLETE_WITH_ERROR (at least one destination failed).
     :rtype: str
     """
     run_id = run['sequencing_run_id']
-    db.update_run_status_by_id(config, run_id, 'UPLOAD_STARTED')
+    sequencer = run['sequencer']
+    if destinations is None:
+        destinations = sequencer['destination_servers']
     log.info({"event_type": "upload_started", "sequencing_run_id": run_id})
     destination_errors = []
-    try:
-        for sequencer in config['sequencers']:
-            for destination_server in sequencer['destination_servers']:
-                server_id = destination_server.get('server_id', destination_server.get('server_address'))
-                timestamp_upload_start = datetime.datetime.now().isoformat()
-                try:
-                    rsync_returncode = rsync_to_destination(
-                        run, sequencer, destination_server,
-                        on_progress=on_progress,
-                        on_process_started=on_process_started,
-                        rsync_stderr=rsync_stderr,
-                    )
-                    timestamp_upload_complete = datetime.datetime.now().isoformat()
 
-                    if cancel_event is not None and cancel_event.is_set():
-                        db.update_run_status_by_id(config, run_id, 'UPLOAD_INCOMPLETE')
-                        log.info({"event_type": "upload_cancelled", "sequencing_run_id": run_id})
-                        return 'UPLOAD_INCOMPLETE'
+    def record(server_id: str, timestamp_upload_start: str, result: str, detail: str = ''):
+        history.record_upload(config, {
+            'timestamp_start': timestamp_upload_start,
+            'timestamp_end': datetime.datetime.now().isoformat(),
+            'sequencing_run_id': run_id,
+            'instrument_id': run.get('instrument_id'),
+            'server_id': server_id,
+            'result': result,
+            'detail': detail,
+        })
 
-                    if rsync_returncode != 0:
-                        raise UploadError(describe_rsync_returncode(rsync_returncode))
+    for destination_server in destinations:
+        server_id = destination_server.get('server_id') or destination_server.get('server_address')
+        timestamp_upload_start = datetime.datetime.now().isoformat()
+        try:
+            rsync_returncode = rsync_to_destination(
+                run, sequencer, destination_server,
+                on_progress=on_progress,
+                on_process_started=on_process_started,
+                rsync_stderr=rsync_stderr,
+            )
+            timestamp_upload_complete = datetime.datetime.now().isoformat()
 
-                    write_upload_complete_file(destination_server, run_id, timestamp_upload_start, timestamp_upload_complete)
-                    log.info({"event_type": "destination_upload_complete", "sequencing_run_id": run_id, "server_id": server_id})
-                # A problem with one destination shouldn't stop the run being copied to the others.
-                except (UploadError, OSError, paramiko.SSHException) as e:
-                    # Expected problems (rsync errors, network, permissions, SSH), so no traceback.
-                    destination_errors.append(f"{server_id}: {e}")
-                    log.error({
-                        "event_type": "destination_upload_failed",
-                        "sequencing_run_id": run_id,
-                        "server_id": server_id,
-                        "error_type": type(e).__name__,
-                        "error": str(e),
-                    })
-                except Exception as e:
-                    destination_errors.append(f"{server_id}: {type(e).__name__}: {e}")
-                    log.error({
-                        "event_type": "destination_upload_failed",
-                        "sequencing_run_id": run_id,
-                        "server_id": server_id,
-                        "error_type": type(e).__name__,
-                        "error": str(e),
-                    }, exc_info=True)
-    except KeyboardInterrupt:
-        db.update_run_status_by_id(config, run_id, 'UPLOAD_INCOMPLETE')
-        raise
+            if cancel_event is not None and cancel_event.is_set():
+                record(server_id, timestamp_upload_start, history.CANCELLED)
+                log.info({"event_type": "upload_cancelled", "sequencing_run_id": run_id})
+                return 'UPLOAD_INCOMPLETE'
+
+            if rsync_returncode != 0:
+                raise UploadError(describe_rsync_returncode(rsync_returncode))
+
+            write_upload_complete_file(destination_server, run_id, timestamp_upload_start, timestamp_upload_complete)
+            record(server_id, timestamp_upload_start, history.COMPLETE)
+            log.info({"event_type": "destination_upload_complete", "sequencing_run_id": run_id, "server_id": server_id})
+        except KeyboardInterrupt:
+            record(server_id, timestamp_upload_start, history.CANCELLED)
+            raise
+        # A problem with one destination shouldn't stop the run being copied to the others.
+        except (UploadError, OSError, paramiko.SSHException) as e:
+            # Expected problems (rsync errors, network, permissions, SSH), so no traceback.
+            destination_errors.append(f"{server_id}: {e}")
+            record(server_id, timestamp_upload_start, history.FAILED, str(e))
+            log.error({
+                "event_type": "destination_upload_failed",
+                "sequencing_run_id": run_id,
+                "server_id": server_id,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            })
+        except Exception as e:
+            destination_errors.append(f"{server_id}: {type(e).__name__}: {e}")
+            record(server_id, timestamp_upload_start, history.FAILED, f"{type(e).__name__}: {e}")
+            log.error({
+                "event_type": "destination_upload_failed",
+                "sequencing_run_id": run_id,
+                "server_id": server_id,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }, exc_info=True)
 
     if destination_errors:
-        db.update_run_status_by_id(config, run_id, 'UPLOAD_INCOMPLETE_WITH_ERROR')
         log.error({
             "event_type": "upload_failed",
             "sequencing_run_id": run_id,
@@ -509,6 +559,5 @@ def upload_run(
         })
         return 'UPLOAD_INCOMPLETE_WITH_ERROR'
 
-    db.update_run_status_by_id(config, run_id, 'UPLOAD_COMPLETE')
     log.info({"event_type": "upload_complete", "sequencing_run_id": run_id})
     return 'UPLOAD_COMPLETE'

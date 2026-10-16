@@ -26,7 +26,27 @@ def test_find_runs_finds_complete_runs(config, run_output_dir):
         "instrument_type": "GRIDION",
         "instrument_id": "GXB03493",
         "run_directory": str(run_dir),
+        "sequencer": config["sequencers"][0],
     }]
+
+
+def test_runs_carry_their_own_sequencers_config(config, run_output_dir, tmp_path):
+    # So that each run is uploaded to its own sequencer's destinations.
+    promethion_output_dir = tmp_path / "runs" / "promethion"
+    promethion_output_dir.mkdir(parents=True)
+    promethion = {
+        "instrument_id": "P2S-01234",
+        "instrument_type": "promethion",
+        "run_output_dir": str(promethion_output_dir),
+        "destination_servers": [],
+    }
+    config["sequencers"].append(promethion)
+    make_run(run_output_dir, GRIDION_RUN_ID)
+    make_run(promethion_output_dir, PROMETHION_RUN_ID)
+
+    sequencers = {run["sequencing_run_id"]: run["sequencer"] for run in core.find_runs(config)}
+
+    assert sequencers == {GRIDION_RUN_ID: config["sequencers"][0], PROMETHION_RUN_ID: promethion}
 
 
 def test_find_runs_recognizes_promethion_run_ids(config, run_output_dir):

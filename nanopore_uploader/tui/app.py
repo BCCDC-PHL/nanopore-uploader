@@ -8,7 +8,6 @@ from them. rsync progress comes in through a separate callback, because only eve
 """
 
 import collections
-import csv
 import datetime
 import json
 import logging
@@ -28,24 +27,34 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Label, ProgressBar, RichLog, Static
 
+import nanopore_uploader.core as core
 from nanopore_uploader.service import Uploader
 
 log = logging.getLogger(__name__)
 
 MAX_LOG_ENTRIES = 5000
 
-# Statuses that only exist in the TUI (the db doesn't record failures or exclusions).
+# Run statuses: where the run is at on its destinations (core.UPLOADED etc., from the uploader's checks),
+# plus a few that only exist in the TUI.
 UPLOAD_FAILED = 'UPLOAD_FAILED'
 EXCLUDED = 'EXCLUDED'
+QUEUED = 'QUEUED'
 
 STATUS_DISPLAY = {
-    'QUEUED_FOR_UPLOAD': ("◷ Queued", "yellow"),
-    'UPLOAD_STARTED': ("◐ Started, not finished", "dark_orange"),
-    'UPLOAD_COMPLETE': ("✓ Complete", "green"),
-    'UPLOAD_INCOMPLETE': ("✗ Incomplete", "red"),
-    'UPLOAD_INCOMPLETE_WITH_ERROR': ("✗ Error", "red"),
+    core.ABSENT: ("◷ Ready to upload", "yellow"),
+    core.PARTIAL: ("◐ Partly uploaded", "dark_orange"),
+    core.UPLOADED: ("✓ Uploaded", "green"),
+    core.UNKNOWN: ("? Can't check server", "magenta"),
+    QUEUED: ("◷ Queued to upload again", "yellow"),
     UPLOAD_FAILED: ("✗ Failed", "bold red"),
     EXCLUDED: ("– Excluded", "dim"),
+}
+
+DESTINATION_STATE_DESCRIPTIONS = {
+    core.ABSENT: "not uploaded",
+    core.PARTIAL: "partly uploaded",
+    core.UPLOADED: "uploaded",
+    core.UNKNOWN: "can't check",
 }
 ACTIVE_UPLOAD_DISPLAY = ("● Uploading", "bold cyan")
 
@@ -61,6 +70,7 @@ QUIET_EVENTS = {
     'candidate_run_dirs_found',
     'found_run',
     'scan_started',
+    'remote_runs_listed',
     'upload_started',
     'upload_progress_update',
     'upload_complete_file_written',
@@ -163,6 +173,8 @@ class RunInfo:
     protocol_group_id: Optional[str] = None
     run_directory: Optional[str] = None
     last_error: Optional[str] = None
+    # {server_id: core.UPLOADED etc.}, from the uploader's last check.
+    destinations: Optional[dict[str, str]] = None
     timestamp_updated: Optional[datetime.datetime] = None
 
 
@@ -357,21 +369,9 @@ class UploaderApp(App):
 
     def _load_known_runs(self):
         """
-        Fill the runs table from the db and the excluded runs list, so it isn't empty until the first scan finishes.
+        Show the excluded runs. (Excluded runs are skipped by scans, so they wouldn't appear otherwise.)
         """
-        config = self.uploader.config
-        db_file = config.get('db', {}).get('file')
-        if db_file and os.path.exists(db_file):
-            try:
-                with open(db_file, newline='') as f:
-                    for row in csv.DictReader(f):
-                        run_id = row.get('sequencing_run_id')
-                        if run_id:
-                            self._update_run(run_id, status=row.get('status'), instrument=guess_instrument(run_id), touch=False)
-            except Exception as e:
-                log.warning({"event_type": "db_read_failed", "db_file": db_file, "error": str(e)})
-
-        for run_id in config.get('excluded_runs', []):
+        for run_id in self.uploader.config.get('excluded_runs', []):
             self._update_run(run_id, status=EXCLUDED, instrument=guess_instrument(run_id), touch=False)
 
     def _update_run(self, run_id: str, touch: bool = True, **changes):
@@ -427,6 +427,11 @@ class UploaderApp(App):
             return
         text = Text()
         text.append(run.run_directory or "Not found on disk by a scan yet", style="italic")
+        if run.destinations:
+            text.append("\nDestinations: ", style="bold")
+            text.append(" · ".join(
+                f"{server_id}: {DESTINATION_STATE_DESCRIPTIONS.get(state, state)}" for server_id, state in run.destinations.items()
+            ))
         if run.last_error:
             text.append("\nLast error: ", style="bold red")
             text.append(run.last_error)
@@ -467,20 +472,26 @@ class UploaderApp(App):
                 protocol_group_id=payload.get('protocol_group_id'),
                 run_directory=payload.get('run_directory'),
             )
-        elif event_type == 'run_status_checked':
+        elif event_type == 'run_checked':
             run = self.runs.get(run_id)
-            # The db doesn't know about failures, so don't let a re-check hide one.
-            if run is None or run.status != UPLOAD_FAILED or payload.get('status') == 'QUEUED_FOR_UPLOAD':
-                self._update_run(run_id, touch=False, status=payload.get('status'))
+            state = payload.get('state')
+            # A failed upload leaves the run partly uploaded (or not at all). Keep showing that it failed until it's retried.
+            if run is not None and run.status == UPLOAD_FAILED and state in (core.ABSENT, core.PARTIAL):
+                state = None
+            self._update_run(run_id, touch=False, status=state, destinations=dict(payload.get('destinations') or {}))
         elif event_type == 'upload_starting':
             self.state = "uploading"
             self.active_upload_run_id = run_id
-            self._update_run(run_id, status='UPLOAD_STARTED', last_error="")
+            self._update_run(run_id, last_error="")
             self._start_upload_panel(run_id)
+        elif event_type == 'destination_upload_complete' and run_id in self.runs:
+            destinations = dict(self.runs[run_id].destinations or {})
+            destinations[payload.get('server_id')] = core.UPLOADED
+            self._update_run(run_id, touch=False, destinations=destinations)
         elif event_type == 'upload_complete':
-            self._update_run(run_id, status='UPLOAD_COMPLETE')
+            self._update_run(run_id, status=core.UPLOADED)
         elif event_type == 'upload_cancelled':
-            self._finish_upload(run_id, 'UPLOAD_INCOMPLETE')
+            self._finish_upload(run_id, core.PARTIAL)
         elif event_type == 'upload_failed':
             error = f"{payload.get('error_type')}: {payload.get('error')}"
             run = self.runs.get(run_id)
@@ -499,7 +510,7 @@ class UploaderApp(App):
                 self._finish_upload(run_id, None)
                 self._update_run(run_id, touch=True)
         elif event_type == 'run_requeued':
-            self._update_run(run_id, status='QUEUED_FOR_UPLOAD', last_error="")
+            self._update_run(run_id, status=QUEUED, last_error="")
         elif event_type == 'upload_retries_exhausted' and run_id in self.runs:
             run = self.runs[run_id]
             note = f"Not retrying after {payload.get('attempts')} attempts. Press r to re-queue it."
@@ -619,7 +630,7 @@ class UploaderApp(App):
         if event_type == 'upload_complete':
             return f"Upload complete: {run_id}"
         if event_type == 'upload_cancelled':
-            return f"Upload stopped: {run_id} (marked UPLOAD_INCOMPLETE)"
+            return f"Upload stopped: {run_id} (partly uploaded; it'll be resumed later)"
         if event_type == 'upload_failed':
             return f"Upload failed: {run_id}: {payload.get('error_type')}: {payload.get('error')}"
         if event_type == 'run_requeued':
@@ -638,8 +649,7 @@ class UploaderApp(App):
             return description
         if event_type == 'upload_retrying':
             return (
-                f"Retrying upload of {run_id} (attempt {payload.get('attempt')} of {payload.get('max_upload_attempts')}; "
-                f"last status {payload.get('previous_status')})"
+                f"Retrying upload of {run_id} (attempt {payload.get('attempt')} of {payload.get('max_upload_attempts')})"
             )
         if event_type == 'upload_retries_exhausted':
             return f"Not retrying {run_id} after {payload.get('attempts')} attempts. Select it and press r to try again."
@@ -647,12 +657,15 @@ class UploaderApp(App):
             return f"Copied {run_id} to {payload.get('server_id')}"
         if event_type == 'destination_upload_failed':
             return f"Copying {run_id} to {payload.get('server_id')} failed: {payload.get('error')}"
+        if event_type == 'remote_listing_failed':
+            return (
+                f"Can't check what's on {payload.get('server_id')}: {payload.get('error_type')}: {payload.get('error')}. "
+                "Nothing will be uploaded there until it can be checked."
+            )
         if event_type == 'check_run_dir_failed':
             return f"Couldn't check {payload.get('run_directory')}: {payload.get('error_type')}: {payload.get('error')}"
         if event_type == 'scan_failed':
             return f"Scan failed: {payload.get('error_type')}: {payload.get('error')}. Will try again at the next scan."
-        if event_type == 'db_file_not_found':
-            return f"Not uploading anything: {payload.get('error')}"
         if event_type == 'upload_progress_update':
             return f"{run_id}: {payload.get('percent_complete')}%"
         if event_type is None:
@@ -702,10 +715,14 @@ class UploaderApp(App):
                 self.uploader.requeue(run.sequencing_run_id)
                 self.notify(f"Re-queued {run.sequencing_run_id}")
 
-        self.push_screen(
-            ConfirmScreen(f"Upload {run.sequencing_run_id} again?\n\nrsync only copies files that are missing or changed on the destination.", yes_label="Re-queue"),
-            confirmed,
-        )
+        question = f"Upload {run.sequencing_run_id} again?\n\nrsync only copies files that are missing or changed on the destination."
+        already_uploaded = run.status == core.UPLOADED or core.UPLOADED in (run.destinations or {}).values()
+        if already_uploaded:
+            question += (
+                "\n\nIt's already uploaded. Uploading it again rewrites upload_complete.json, "
+                "which may start downstream processing again."
+            )
+        self.push_screen(ConfirmScreen(question, yes_label="Re-queue", danger=already_uploaded), confirmed)
 
     def action_exclude(self):
         run = self._selected_run()
@@ -750,7 +767,7 @@ class UploaderApp(App):
             self.push_screen(
                 ConfirmScreen(
                     f"An upload is in progress ({uploading_run_id}).\n\n"
-                    "Quitting will stop it, and the run will be marked UPLOAD_INCOMPLETE.",
+                    "Quitting will stop it. The run will be left partly uploaded, and resumed the next time the uploader runs.",
                     yes_label="Stop upload and quit",
                     danger=True,
                 ),
