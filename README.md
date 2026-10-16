@@ -12,6 +12,17 @@ See [config.json](config.json) for format details.
 
 ## Running
 
+### First-time setup
+Create the upload db file (`db.file` in the config) before the first run:
+```
+nanopore-uploader -c config.json --init-db
+```
+
+The uploader won't start without it. It isn't created automatically, because without it every completed run
+looks new: a mistyped path or an unmounted network share would mean uploading every run on the sequencer again.
+For the same reason, if the db file goes missing while the uploader is running, nothing is uploaded until it's back.
+`--init-db` never overwrites an existing db, and doesn't create missing directories.
+
 ### Typical Run Command
 ```
 nanopore-uploader -c config.json

@@ -370,8 +370,6 @@ class UploaderApp(App):
                             self._update_run(run_id, status=row.get('status'), instrument=guess_instrument(run_id), touch=False)
             except Exception as e:
                 log.warning({"event_type": "db_read_failed", "db_file": db_file, "error": str(e)})
-        else:
-            log.warning({"event_type": "db_file_not_found", "db_file": db_file})
 
         for run_id in config.get('excluded_runs', []):
             self._update_run(run_id, status=EXCLUDED, instrument=guess_instrument(run_id), touch=False)
@@ -654,7 +652,7 @@ class UploaderApp(App):
         if event_type == 'scan_failed':
             return f"Scan failed: {payload.get('error_type')}: {payload.get('error')}. Will try again at the next scan."
         if event_type == 'db_file_not_found':
-            return f"The upload database file wasn't found: {payload.get('db_file')}"
+            return f"Not uploading anything: {payload.get('error')}"
         if event_type == 'upload_progress_update':
             return f"{run_id}: {payload.get('percent_complete')}%"
         if event_type is None:

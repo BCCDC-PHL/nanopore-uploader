@@ -120,6 +120,13 @@ class Uploader:
         self._handle_requests()
 
     def _scan_and_upload(self):
+        # Without the db, every run would look new and be uploaded again, so don't upload anything until it's back.
+        # (eg. it's on a network share that's gone away.) It's never re-created here: see db.check_db_file().
+        try:
+            db.check_db_file(self.config)
+        except (FileNotFoundError, ValueError) as e:
+            log.error({"event_type": "db_file_not_found", "error": str(e)})
+            return
         for run in core.scan(self.config):
             if self._stop_event.is_set():
                 break
