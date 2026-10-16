@@ -30,6 +30,7 @@
         "send_notification_emails": true
     },
     "scan_interval_seconds": 600,
+    "auto_upload": false,
     "max_upload_attempts": 3,
     "excluded_runs_list": "/path/to/excluded_runs.txt",
     "upload_history_file": "/path/to/upload_history.csv"

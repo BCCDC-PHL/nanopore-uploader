@@ -9,7 +9,12 @@ from nanopore_uploader.service import Uploader
 from conftest import GRIDION_RUN_ID, GRIDION_RUN_ID_2, make_destination, make_run, mark_partial, mark_uploaded, save_config
 
 
-def make_uploader(config, **kwargs) -> Uploader:
+def make_uploader(config, auto_upload: bool = True, **kwargs) -> Uploader:
+    """
+    Most tests here are about what gets uploaded automatically, so auto mode is on unless asked otherwise.
+    """
+    config['auto_upload'] = auto_upload
+    save_config(config)
     return Uploader(config['_path'], config, **kwargs)
 
 
@@ -180,7 +185,7 @@ class TestRetries:
         scan_once(uploader)
         assert uploader._upload_attempts == {}
 
-    def test_requeue_resets_attempts(self, config, run_output_dir, fake_rsync, fake_ssh, uploads, monkeypatch):
+    def test_upload_request_resets_attempts(self, config, run_output_dir, fake_rsync, fake_ssh, uploads, monkeypatch):
         make_run(run_output_dir, GRIDION_RUN_ID)
         config['max_upload_attempts'] = 2
         save_config(config)
@@ -190,29 +195,29 @@ class TestRetries:
             scan_once(uploader)
         assert uploads() == [GRIDION_RUN_ID] * 2  # attempts used up
 
-        uploader.requeue(GRIDION_RUN_ID)
+        uploader.upload(GRIDION_RUN_ID)
         for _ in range(3):
             scan_once(uploader)
 
         # The re-queued upload, then one retry: two more attempts, as if it had just been found.
         assert uploads() == [GRIDION_RUN_ID] * 4
 
-    def test_requeue_uploads_an_uploaded_run_again_once(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+    def test_forced_upload_uploads_an_uploaded_run_again_once(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
         make_run(run_output_dir, GRIDION_RUN_ID)
         mark_uploaded(destination_dir, GRIDION_RUN_ID)
         uploader = make_uploader(config)
 
-        uploader.requeue(GRIDION_RUN_ID)
+        uploader.upload(GRIDION_RUN_ID, force=True)
         scan_once(uploader)
         scan_once(uploader)
 
         assert uploads() == [GRIDION_RUN_ID]
 
-    def test_requeue_waits_until_the_destination_can_be_checked(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+    def test_forced_upload_waits_until_the_destination_can_be_checked(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
         make_run(run_output_dir, GRIDION_RUN_ID)
         mark_uploaded(destination_dir, GRIDION_RUN_ID)
         uploader = make_uploader(config)
-        uploader.requeue(GRIDION_RUN_ID)
+        uploader.upload(GRIDION_RUN_ID, force=True)
         fake_ssh.fail = True
         scan_once(uploader)
         assert uploads() == []
@@ -221,6 +226,198 @@ class TestRetries:
         scan_once(uploader)
 
         assert uploads() == [GRIDION_RUN_ID]
+
+
+class TestMonitorMode:
+    """
+    The default: runs are only uploaded when someone asks.
+    """
+
+    def test_is_the_default(self, config):
+        config.pop('auto_upload', None)
+        assert not Uploader(config['_path'], config).auto_upload
+
+    @pytest.mark.parametrize("setting, expected", [(True, True), (False, False), ("true", True), ("false", False), ("no", False)])
+    def test_auto_upload_setting(self, config, setting, expected):
+        config['auto_upload'] = setting
+        assert Uploader(config['_path'], config).auto_upload == expected
+
+    def test_nothing_is_uploaded_without_a_request(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads, caplog):
+        caplog.set_level('INFO')
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        make_run(run_output_dir, GRIDION_RUN_ID_2, sample_id='sample-02')
+        mark_partial(destination_dir, GRIDION_RUN_ID_2)
+        uploader = make_uploader(config, auto_upload=False)
+
+        scan_once(uploader)
+        scan_once(uploader)
+
+        assert uploads() == []
+        awaiting = events(caplog, 'runs_awaiting_upload')
+        assert len(awaiting) == 2
+        assert sorted(awaiting[-1]['sequencing_run_ids']) == [GRIDION_RUN_ID, GRIDION_RUN_ID_2]
+
+    def test_uploaded_runs_arent_reported_as_awaiting_upload(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, caplog):
+        caplog.set_level('INFO')
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+
+        scan_once(make_uploader(config, auto_upload=False))
+
+        assert events(caplog, 'runs_awaiting_upload') == []
+
+    def test_requested_upload(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        make_run(run_output_dir, GRIDION_RUN_ID_2, sample_id='sample-02')
+        uploader = make_uploader(config, auto_upload=False)
+
+        uploader.upload(GRIDION_RUN_ID)
+        scan_once(uploader)
+        scan_once(uploader)
+
+        assert uploads() == [GRIDION_RUN_ID]
+        assert (destination_dir / GRIDION_RUN_ID / 'upload_complete.json').exists()
+
+    def test_requested_upload_of_an_uploaded_run_isnt_needed(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads, caplog):
+        caplog.set_level('INFO')
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config, auto_upload=False)
+
+        uploader.upload(GRIDION_RUN_ID)
+        scan_once(uploader)
+
+        assert uploads() == []
+        assert len(events(caplog, 'upload_not_needed')) == 1
+
+    def test_forced_upload_of_an_uploaded_run(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config, auto_upload=False)
+
+        uploader.upload(GRIDION_RUN_ID, force=True)
+        scan_once(uploader)
+
+        assert uploads() == [GRIDION_RUN_ID]
+
+    def test_a_plain_request_doesnt_undo_a_forced_one(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config, auto_upload=False)
+
+        uploader.upload(GRIDION_RUN_ID, force=True)
+        uploader.upload(GRIDION_RUN_ID)
+        scan_once(uploader)
+
+        assert uploads() == [GRIDION_RUN_ID]
+
+    def test_requested_upload_waits_until_the_destination_can_be_checked(self, config, run_output_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config, auto_upload=False)
+        uploader.upload(GRIDION_RUN_ID)
+        fake_ssh.fail = True
+        scan_once(uploader)
+        assert uploads() == []
+
+        fake_ssh.fail = False
+        scan_once(uploader)
+
+        assert uploads() == [GRIDION_RUN_ID]
+
+    def test_failed_requested_upload_isnt_retried(self, config, run_output_dir, fake_rsync, fake_ssh, uploads, monkeypatch):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        monkeypatch.setenv('FAKE_RSYNC_FAIL', 'archive.example.org')
+        uploader = make_uploader(config, auto_upload=False)
+
+        uploader.upload(GRIDION_RUN_ID)
+        for _ in range(3):
+            scan_once(uploader)
+
+        assert uploads() == [GRIDION_RUN_ID]
+
+    def test_switching_to_auto_mode(self, config, run_output_dir, fake_rsync, fake_ssh, uploads, caplog):
+        caplog.set_level('INFO')
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config, auto_upload=False)
+        scan_once(uploader)
+        assert uploads() == []
+
+        uploader.set_auto_upload(True)
+        scan_once(uploader)
+
+        assert uploads() == [GRIDION_RUN_ID]
+        assert uploader._wake_event.is_set()  # switching to auto mode starts a scan
+        assert events(caplog, 'upload_mode')[-1]['auto_upload'] is True
+
+    def test_switching_to_monitor_mode_lasts_through_config_reloads(self, config, run_output_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        make_run(run_output_dir, GRIDION_RUN_ID_2, sample_id='sample-02')
+        uploader = make_uploader(config, auto_upload=True)
+
+        uploader.set_auto_upload(False)
+        scan_once(uploader)
+
+        assert uploads() == []
+
+
+class TestUploadNow:
+    """
+    One-off uploads from the command line.
+    """
+
+    def test_uploads_where_needed(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+
+        result = make_uploader(config, auto_upload=False).upload_now(GRIDION_RUN_ID)
+
+        assert result == 'UPLOAD_COMPLETE'
+        assert uploads() == [GRIDION_RUN_ID]
+
+    def test_already_uploaded(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+
+        assert make_uploader(config).upload_now(GRIDION_RUN_ID) == 'ALREADY_UPLOADED'
+        assert uploads() == []
+
+    def test_force(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+
+        assert make_uploader(config).upload_now(GRIDION_RUN_ID, force=True) == 'UPLOAD_COMPLETE'
+        assert uploads() == [GRIDION_RUN_ID]
+
+    def test_failure(self, config, run_output_dir, fake_rsync, fake_ssh, monkeypatch):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        monkeypatch.setenv('FAKE_RSYNC_FAIL', 'archive.example.org')
+
+        assert make_uploader(config).upload_now(GRIDION_RUN_ID) == 'UPLOAD_INCOMPLETE_WITH_ERROR'
+
+    def test_destination_cant_be_checked(self, config, run_output_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        fake_ssh.fail = True
+
+        assert make_uploader(config).upload_now(GRIDION_RUN_ID) == core.UNKNOWN
+        assert uploads() == []
+
+    def test_unknown_run(self, config, fake_rsync, fake_ssh):
+        with pytest.raises(LookupError, match=GRIDION_RUN_ID):
+            make_uploader(config).upload_now(GRIDION_RUN_ID)
+
+    def test_incomplete_run(self, config, run_output_dir, fake_rsync, fake_ssh):
+        make_run(run_output_dir, GRIDION_RUN_ID, complete=False)
+
+        with pytest.raises(LookupError):
+            make_uploader(config).upload_now(GRIDION_RUN_ID)
+
+    def test_excluded_run(self, config, run_output_dir, fake_rsync, fake_ssh, uploads):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        config['excluded_runs'] = [GRIDION_RUN_ID]
+        uploader = Uploader(config['_path'], config)
+
+        with pytest.raises(ValueError, match="excluded"):
+            uploader.upload_now(GRIDION_RUN_ID)
+        assert uploads() == []
 
 
 class TestRequests:

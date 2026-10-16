@@ -5,7 +5,10 @@ import json
 
 import pytest
 
+import nanopore_uploader.core as core
 from nanopore_uploader.__main__ import main
+
+from conftest import GRIDION_RUN_ID, make_run, mark_uploaded
 
 
 @pytest.fixture
@@ -42,3 +45,47 @@ def test_old_db_setting_is_noted_but_ignored(tmp_path, started, caplog):
     notes = [r.msg for r in caplog.records if isinstance(r.msg, dict) and r.msg.get("event_type") == "config_setting_unused"]
     assert [note["setting"] for note in notes] == ["db"]
     assert not (tmp_path / "uploads.csv").exists()
+
+
+class TestUploadOneRun:
+    def test_uploads_and_exits(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, started, capsys):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+
+        main(["-c", config["_path"], "--upload", GRIDION_RUN_ID])
+
+        assert f"Uploaded {GRIDION_RUN_ID}" in capsys.readouterr().out
+        assert (destination_dir / GRIDION_RUN_ID / core.UPLOAD_COMPLETE_FILENAME).exists()
+        assert started == []  # the scan loop isn't started
+
+    def test_already_uploaded(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, started, capsys):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+
+        main(["-c", config["_path"], "--upload", GRIDION_RUN_ID])
+
+        assert "already uploaded" in capsys.readouterr().out
+        assert fake_rsync.calls() == []
+
+    def test_force(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, started):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+
+        main(["-c", config["_path"], "--upload", GRIDION_RUN_ID, "--force"])
+
+        assert len(fake_rsync.calls()) == 1
+
+    def test_failure_exits_with_an_error(self, config, run_output_dir, fake_rsync, fake_ssh, started, monkeypatch):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        monkeypatch.setenv("FAKE_RSYNC_FAIL", "archive.example.org")
+
+        with pytest.raises(SystemExit, match="failed"):
+            main(["-c", config["_path"], "--upload", GRIDION_RUN_ID])
+
+    def test_unknown_run(self, config, fake_rsync, fake_ssh, started):
+        with pytest.raises(SystemExit, match="No complete run"):
+            main(["-c", config["_path"], "--upload", GRIDION_RUN_ID])
+
+    def test_force_needs_upload(self, config, started):
+        with pytest.raises(SystemExit):
+            main(["-c", config["_path"], "--force"])
+        assert started == []
