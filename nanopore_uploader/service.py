@@ -13,6 +13,11 @@ import nanopore_uploader.db as db
 from nanopore_uploader.config import load_config
 
 DEFAULT_SCAN_INTERVAL_SECONDS = 3600.0
+DEFAULT_MAX_UPLOAD_ATTEMPTS = 3
+
+# Statuses of runs whose last upload didn't finish, which are uploaded again (up to `max_upload_attempts` times).
+# UPLOAD_STARTED is left behind if the uploader was killed or lost power mid-upload.
+RETRYABLE_STATUSES = ('UPLOAD_STARTED', 'UPLOAD_INCOMPLETE', 'UPLOAD_INCOMPLETE_WITH_ERROR')
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +48,10 @@ class Uploader:
     In TUI mode, `run()` is called on a worker thread, and the TUI uses `scan_now()`, `requeue()`,
     `exclude()` and `stop()` to control it. Requests from the TUI are queued and carried out
     on the worker thread between runs, so the worker is the only thing that writes to the db.
+
+    Runs whose upload didn't finish (see `RETRYABLE_STATUSES`) are uploaded again on later scans, up to
+    `max_upload_attempts` uploads per run (default 3) since the uploader started. After that they're left
+    alone until they're re-queued, or the uploader is restarted.
     """
 
     def __init__(
@@ -68,6 +77,9 @@ class Uploader:
         self._rsync_process: Optional[subprocess.Popen] = None
         self._rsync_process_lock = threading.Lock()
         self._uploading_run_id: Optional[str] = None
+        # Uploads started for each run since the uploader started, reset when a run is uploaded or re-queued.
+        self._upload_attempts: dict[str, int] = {}
+        self._retries_exhausted_logged: set[str] = set()
 
     def run(self):
         """
@@ -78,51 +90,12 @@ class Uploader:
             self._handle_requests()
             scan_start_timestamp = datetime.datetime.now()
             log.info({"event_type": "scan_started"})
-            for run in core.scan(self.config):
-                if self._stop_event.is_set():
-                    break
-                log.info({
-                    "event_type": "found_run",
-                    "sequencing_run_id": run['sequencing_run_id'],
-                    "instrument_type": run['instrument_type'],
-                    "instrument_id": run['instrument_id'],
-                    "protocol_group_id": run['protocol_group_id'],
-                    "run_directory": run['run_directory'],
-                })
-                self.config = reload_config(self.config_path, self.config)
-                if run['sequencing_run_id'] in self.config.get('excluded_runs', []):
-                    continue
-                try:
-                    run['status'] = core.check_run_status(self.config, run)
-                    log.debug({
-                        "event_type": "run_status_checked",
-                        "sequencing_run_id": run['sequencing_run_id'],
-                        "status": run['status'],
-                    })
-                    if run['status'] == 'QUEUED_FOR_UPLOAD':
-                        log.info({
-                            "event_type": "upload_starting",
-                            "sequencing_run_id": run['sequencing_run_id'],
-                        })
-                        self._upload_run(run)
-                # A problem with one run shouldn't stop other runs from being checked.
-                except OSError as e:
-                    # Expected, environmental problems (missing files, permissions, network storage).
-                    # The message says what went wrong, so a traceback wouldn't add anything.
-                    log.error({
-                        "event_type": "upload_failed",
-                        "sequencing_run_id": run['sequencing_run_id'],
-                        "error_type": type(e).__name__, "error": str(e)
-                    })
-                except Exception as e:
-                    # Unexpected problems are probably bugs, so include the traceback.
-                    log.error({
-                        "event_type": "upload_failed",
-                        "sequencing_run_id": run['sequencing_run_id'],
-                        "error_type": type(e).__name__,
-                        "error": str(e)
-                    }, exc_info=True)
-                self._handle_requests()
+            try:
+                self._scan_and_upload()
+            except Exception as e:
+                # Problems with individual runs are handled in _scan_and_upload, so this is probably a bug,
+                # or a problem with the config. Keep going: the next scan may work (eg. after the config is fixed).
+                log.error({"event_type": "scan_failed", "error_type": type(e).__name__, "error": str(e)}, exc_info=True)
 
             if self._stop_event.is_set():
                 break
@@ -142,6 +115,88 @@ class Uploader:
 
             # Waiting on an event (rather than sleeping) lets scan_now() and stop() interrupt the wait.
             self._wake_event.wait(max(0, (next_scan_timestamp - datetime.datetime.now()).total_seconds()))
+
+        # Don't lose a request (eg. an exclusion) made just before stopping.
+        self._handle_requests()
+
+    def _scan_and_upload(self):
+        for run in core.scan(self.config):
+            if self._stop_event.is_set():
+                break
+            log.info({
+                "event_type": "found_run",
+                "sequencing_run_id": run['sequencing_run_id'],
+                "instrument_type": run['instrument_type'],
+                "instrument_id": run['instrument_id'],
+                "protocol_group_id": run['protocol_group_id'],
+                "run_directory": run['run_directory'],
+            })
+            self.config = reload_config(self.config_path, self.config)
+            if run['sequencing_run_id'] in self.config.get('excluded_runs', []):
+                continue
+            try:
+                run['status'] = core.check_run_status(self.config, run)
+                log.debug({
+                    "event_type": "run_status_checked",
+                    "sequencing_run_id": run['sequencing_run_id'],
+                    "status": run['status'],
+                })
+                if run['status'] == 'QUEUED_FOR_UPLOAD' or (run['status'] in RETRYABLE_STATUSES and self._should_retry(run)):
+                    log.info({
+                        "event_type": "upload_starting",
+                        "sequencing_run_id": run['sequencing_run_id'],
+                    })
+                    self._upload_run(run)
+            # A problem with one run shouldn't stop other runs from being checked.
+            except OSError as e:
+                # Expected, environmental problems (missing files, permissions, network storage).
+                # The message says what went wrong, so a traceback wouldn't add anything.
+                log.error({
+                    "event_type": "upload_failed",
+                    "sequencing_run_id": run['sequencing_run_id'],
+                    "error_type": type(e).__name__, "error": str(e)
+                })
+            except Exception as e:
+                # Unexpected problems are probably bugs, so include the traceback.
+                log.error({
+                    "event_type": "upload_failed",
+                    "sequencing_run_id": run['sequencing_run_id'],
+                    "error_type": type(e).__name__,
+                    "error": str(e)
+                }, exc_info=True)
+            self._handle_requests()
+
+    def _max_upload_attempts(self) -> int:
+        try:
+            return max(1, int(self.config.get('max_upload_attempts', DEFAULT_MAX_UPLOAD_ATTEMPTS)))
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_UPLOAD_ATTEMPTS
+
+    def _should_retry(self, run: dict[str, object]) -> bool:
+        """
+        Decide whether to upload a run again, whose last upload didn't finish.
+        """
+        run_id = run['sequencing_run_id']
+        attempts = self._upload_attempts.get(run_id, 0)
+        max_attempts = self._max_upload_attempts()
+        if attempts < max_attempts:
+            log.info({
+                "event_type": "upload_retrying",
+                "sequencing_run_id": run_id,
+                "previous_status": run['status'],
+                "attempt": attempts + 1,
+                "max_upload_attempts": max_attempts,
+            })
+            return True
+        if run_id not in self._retries_exhausted_logged:
+            self._retries_exhausted_logged.add(run_id)
+            log.warning({
+                "event_type": "upload_retries_exhausted",
+                "sequencing_run_id": run_id,
+                "status": run['status'],
+                "attempts": attempts,
+            })
+        return False
 
     def scan_now(self):
         """
@@ -196,10 +251,12 @@ class Uploader:
                 process.terminate()
 
     def _upload_run(self, run: dict[str, object]):
+        run_id = run['sequencing_run_id']
         rsync_stderr = tempfile.TemporaryFile(mode='w+') if self.capture_rsync_stderr else None
-        self._uploading_run_id = run['sequencing_run_id']
+        self._uploading_run_id = run_id
+        self._upload_attempts[run_id] = self._upload_attempts.get(run_id, 0) + 1
         try:
-            core.upload_run(
+            status = core.upload_run(
                 self.config,
                 run,
                 on_progress=self.on_progress,
@@ -207,6 +264,8 @@ class Uploader:
                 cancel_event=self._stop_event,
                 rsync_stderr=rsync_stderr,
             )
+            if status == 'UPLOAD_COMPLETE':
+                self._forget_attempts(run_id)
         finally:
             self._set_rsync_process(None)
             self._uploading_run_id = None
@@ -222,6 +281,10 @@ class Uploader:
                         "stderr": stderr_text,
                     })
 
+    def _forget_attempts(self, run_id: str):
+        self._upload_attempts.pop(run_id, None)
+        self._retries_exhausted_logged.discard(run_id)
+
     def _handle_requests(self):
         while True:
             try:
@@ -231,6 +294,7 @@ class Uploader:
             try:
                 if request == 'requeue':
                     db.update_run_status_by_id(self.config, run_id, 'QUEUED_FOR_UPLOAD')
+                    self._forget_attempts(run_id)
                     log.info({"event_type": "run_requeued", "sequencing_run_id": run_id})
                 elif request == 'exclude':
                     self._exclude_run(run_id)

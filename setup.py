@@ -9,7 +9,7 @@ setup(
     author_email='dan.fornika@bccdc.ca',
     url='https://github.com/BCCDC-PHL/nanopore-uploader',
     packages=find_packages(exclude=('test', 'test.*')),
-    python_requires='>=3.10',
+    python_requires='>=3.11',
     install_requires=[
         "paramiko~=2.11.0",
         "requests~=2.32",
@@ -17,6 +17,7 @@ setup(
     ],
     extras_require={
         "tui": ["textual>=8.2"],
+        "test": ["pytest>=8", "textual>=8.2"],
     },
     setup_requires=[],
     tests_require=[],

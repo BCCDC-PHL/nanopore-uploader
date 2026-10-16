@@ -19,6 +19,11 @@ nanopore-uploader -c config.json
 
 To exit, use "Ctrl + C" keyboard combo. Its safe!
 
+A run is marked `UPLOAD_COMPLETE` once it has been copied to every destination server. If any destination fails,
+the run is marked `UPLOAD_INCOMPLETE_WITH_ERROR` and retried on later scans, up to `max_upload_attempts` times
+(default 3). Runs left `UPLOAD_STARTED` or `UPLOAD_INCOMPLETE` (eg. by Ctrl+C, or a crash) are resumed the same way.
+The attempt count resets when the uploader restarts.
+
 ### Interactive dashboard (experimental)
 ```
 pip install -e '.[tui]'
@@ -55,3 +60,11 @@ Backup database (recommended once a week)
 ```
 nanopore-uploader --backup-db
 ```
+
+## Running tests
+```
+pip install -e '.[test]'
+pytest
+```
+
+The tests use a fake `rsync` and a fake SSH client, so they don't need network access or an SSH server.
