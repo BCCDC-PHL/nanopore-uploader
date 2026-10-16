@@ -1,5 +1,8 @@
+import copy
 import threading
 import time
+
+from pathlib import Path
 
 import pytest
 
@@ -103,6 +106,16 @@ class TestWhatGetsUploaded:
         assert uploads() == []
         assert len(events(caplog, 'remote_listing_failed')) == 1
 
+    def test_nothing_is_uploaded_if_the_listing_times_out(self, config, run_output_dir, fake_rsync, fake_ssh, uploads, caplog):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        fake_ssh.hang = True
+
+        scan_once(make_uploader(config))
+
+        assert uploads() == []
+        [failed] = events(caplog, 'remote_listing_failed')
+        assert failed['error_type'] == 'TimeoutError'
+
     def test_each_destination_is_listed_once_per_scan(self, config, run_output_dir, fake_rsync, fake_ssh):
         make_run(run_output_dir, GRIDION_RUN_ID)
         make_run(run_output_dir, GRIDION_RUN_ID_2, sample_id='sample-02')
@@ -127,6 +140,42 @@ class TestWhatGetsUploaded:
         scan_once(make_uploader(config))
 
         assert uploads() == []
+
+
+class TestConfigChanges:
+    def test_config_changes_apply_to_the_rest_of_the_scan(self, config, run_output_dir, tmp_path, fake_rsync, fake_ssh, monkeypatch):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        make_run(run_output_dir, GRIDION_RUN_ID_2, sample_id='sample-02')
+        uploader = make_uploader(config)
+        new_destination = make_destination(tmp_path, 'new-archive')
+        upload_run = core.upload_run
+
+        def upload_run_then_change_destination(config_, run, **kwargs):
+            # Someone edits the config file to change the sequencer's destination while the first run is uploading.
+            result = upload_run(config_, run, **kwargs)
+            edited = copy.deepcopy(config)
+            edited['sequencers'][0]['destination_servers'] = [new_destination]
+            save_config(edited)
+            return result
+
+        monkeypatch.setattr(core, 'upload_run', upload_run_then_change_destination)
+
+        scan_once(uploader)
+
+        assert [args[-1].split('@')[1].split('.')[0] for args in fake_rsync.calls()] == ['archive', 'new-archive']
+
+    def test_runs_from_a_removed_sequencer_are_skipped(self, config, run_output_dir, fake_rsync, fake_ssh, uploads, caplog):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config)
+        config['sequencers'][0]['run_output_dir'] = str(run_output_dir.parent / 'elsewhere')
+        save_config(config)
+
+        # The run list comes from the config the scan started with; the run is found, but its sequencer has gone.
+        uploader.config['sequencers'][0]['run_output_dir'] = str(run_output_dir)
+        scan_once(uploader)
+
+        assert uploads() == []
+        assert events(caplog, 'run_skipped')[0]['sequencing_run_id'] == GRIDION_RUN_ID
 
 
 class TestMultipleDestinations:
@@ -155,6 +204,41 @@ class TestMultipleDestinations:
         scan_once(make_uploader(config))
 
         assert [args[-1].split('@')[1].split('.')[0] for args in fake_rsync.calls()] == ['archive']
+
+
+class TestSharedServerIds:
+    """
+    Destinations with the same server_id (eg. different directories on one server) are kept apart.
+    """
+
+    @pytest.fixture
+    def second_destination(self, config, tmp_path):
+        second = make_destination(tmp_path, 'archive-2')
+        second['server_id'] = 'archive'
+        second['server_address'] = 'archive.example.org'
+        config['sequencers'][0]['destination_servers'].append(second)
+        save_config(config)
+        return second
+
+    def test_unknown_destination_isnt_uploaded_to(self, config, run_output_dir, destination_dir, second_destination, fake_rsync, fake_ssh):
+        # The first destination can't be checked; the second, with the same server_id, can.
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        destination_dir.rename(destination_dir.with_name('away'))
+
+        scan_once(make_uploader(config))
+
+        assert [args[-1].split(':', 1)[1] for args in fake_rsync.calls()] == [second_destination['destination_dir']]
+
+    def test_uploaded_destination_isnt_uploaded_to_again(self, config, run_output_dir, second_destination, fake_rsync, fake_ssh, caplog):
+        caplog.set_level('DEBUG')
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(Path(second_destination['destination_dir']), GRIDION_RUN_ID)
+
+        scan_once(make_uploader(config))
+
+        assert [args[-1].split(':', 1)[1] for args in fake_rsync.calls()] == [config['sequencers'][0]['destination_servers'][0]['destination_dir']]
+        [checked] = events(caplog, 'run_checked')
+        assert sorted(checked['destinations'].values()) == [core.ABSENT, core.UPLOADED]
 
 
 class TestRetries:
@@ -212,6 +296,21 @@ class TestRetries:
         scan_once(uploader)
 
         assert uploads() == [GRIDION_RUN_ID]
+
+    def test_failed_reupload_is_retried(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads, monkeypatch):
+        # A failed re-upload mustn't leave the run looking uploaded (by its old upload_complete.json).
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config)
+        uploader.upload(GRIDION_RUN_ID, force=True)
+        monkeypatch.setenv('FAKE_RSYNC_FAIL', 'archive.example.org')
+        scan_once(uploader)
+
+        monkeypatch.delenv('FAKE_RSYNC_FAIL')
+        scan_once(uploader)
+
+        assert uploads() == [GRIDION_RUN_ID] * 2
+        assert (destination_dir / GRIDION_RUN_ID / 'upload_complete.json').exists()
 
     def test_forced_upload_waits_until_the_destination_can_be_checked(self, config, run_output_dir, destination_dir, fake_rsync, fake_ssh, uploads):
         make_run(run_output_dir, GRIDION_RUN_ID)

@@ -58,6 +58,8 @@ def test_find_runs_recognizes_promethion_run_ids(config, run_output_dir):
 def test_find_runs_ignores_incomplete_and_badly_named_runs(config, run_output_dir):
     make_run(run_output_dir, GRIDION_RUN_ID, complete=False)
     make_run(run_output_dir, "20261014_not_a_run_id")
+    # Starts like a run ID, but has more after it.
+    make_run(run_output_dir, GRIDION_RUN_ID + "_old", sample_id="sample-02")
     # Too shallow: run dirs are three levels below run_output_dir.
     (run_output_dir / GRIDION_RUN_ID_2).mkdir()
     (run_output_dir / GRIDION_RUN_ID_2 / "final_summary_x.txt").write_text("a=b\n")

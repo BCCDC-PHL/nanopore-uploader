@@ -197,15 +197,22 @@ def fake_ssh(monkeypatch):
     Replace paramiko's SSH client with one that works on the local filesystem: commands (the remote runs
     listing) run locally, and `upload_complete.json` is written to the local destination directory.
 
-    Set `fake_ssh.fail = True` to make connecting fail, or `fake_ssh.fail_sftp = True` to make only writing
-    `upload_complete.json` fail. `fake_ssh.commands` has the commands run so far.
+    Set `fake_ssh.fail = True` to make connecting fail, `fake_ssh.fail_sftp = True` to make writing
+    `upload_complete.json` fail part way through (leaving a partly-written temporary file), `fake_ssh.fail_rename = True`
+    to make putting it in place fail, or `fake_ssh.hang = True` to make commands time out.
+    `fake_ssh.commands` has the commands run so far (with their timeouts in `fake_ssh.timeouts`), `fake_ssh.written`
+    the `upload_complete.json` files written, and `fake_ssh.removed` the files removed.
     """
     class FakeSSH:
         def __init__(self):
             self.fail = False
             self.fail_sftp = False
+            self.fail_rename = False
+            self.hang = False
             self.written: list[str] = []
+            self.removed: list[str] = []
             self.commands: list[str] = []
+            self.timeouts: list = []
 
     state = FakeSSH()
 
@@ -216,6 +223,8 @@ def fake_ssh(monkeypatch):
             self.exit_status = exit_status
 
         def read(self) -> bytes:
+            if state.hang:
+                raise TimeoutError("timed out (fake)")
             return self.data
 
         def recv_exit_status(self) -> int:
@@ -223,12 +232,23 @@ def fake_ssh(monkeypatch):
 
     class LocalSFTP:
         def putfo(self, fl, remotepath):
-            if state.fail_sftp:
-                raise OSError("Permission denied (fake)")
             os.makedirs(os.path.dirname(remotepath), exist_ok=True)
             with open(remotepath, "wb") as f:
-                f.write(fl.read())
-            state.written.append(remotepath)
+                data = fl.read()
+                if state.fail_sftp:
+                    f.write(data[:5])
+                    raise OSError("Connection lost (fake)")
+                f.write(data)
+
+        def posix_rename(self, oldpath, newpath):
+            if state.fail_rename:
+                raise OSError("Failure (fake)")
+            os.replace(oldpath, newpath)
+            state.written.append(newpath)
+
+        def remove(self, path):
+            os.remove(path)  # raises FileNotFoundError, as paramiko does
+            state.removed.append(path)
 
         def close(self):
             pass
@@ -246,8 +266,9 @@ def fake_ssh(monkeypatch):
         def open_sftp(self):
             return LocalSFTP()
 
-        def exec_command(self, command):
+        def exec_command(self, command, timeout=None):
             state.commands.append(command)
+            state.timeouts.append(timeout)
             result = subprocess.run(command, shell=True, capture_output=True)
             return None, ChannelFile(result.stdout, result.returncode), ChannelFile(result.stderr, result.returncode)
 
