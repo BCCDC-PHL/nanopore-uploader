@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import threading
 
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import paramiko
@@ -15,6 +16,9 @@ from nanopore_uploader.config import load_config
 
 DEFAULT_SCAN_INTERVAL_SECONDS = 3600.0
 DEFAULT_MAX_UPLOAD_ATTEMPTS = 3
+
+# upload_now() result: uploaded wherever it could be checked, but at least one destination couldn't be.
+SOME_DESTINATIONS_UNCHECKED = 'SOME_DESTINATIONS_UNCHECKED'
 
 log = logging.getLogger(__name__)
 
@@ -37,22 +41,35 @@ def reload_config(config_path: os.PathLike, current_config: dict[str, object]) -
         return current_config
 
 
+@dataclass
+class UploadRequest:
+    """
+    An upload someone has asked for.
+    """
+    # Upload again even where the run's already uploaded (rewriting upload_complete.json).
+    force: bool = False
+    # Destinations (core.destination_key) already uploaded to for this request.
+    attempted: set = field(default_factory=set)
+
+
 class Uploader:
     """
     The scan/upload loop.
 
     Nothing about a run's state is stored: on each scan, each complete run is checked against its
-    sequencer's destination servers (see `core.list_remote_runs`). A run is uploaded to the destinations
+    sequencer's destination servers (see `core.list_remote_runs`). A run needs uploading to the destinations
     where it's ABSENT or PARTIAL. A destination that can't be checked (UNKNOWN) is left alone.
 
-    In headless mode, `run()` is called on the main thread and Ctrl+C (KeyboardInterrupt) stops it.
-    In TUI mode, `run()` is called on a worker thread, and the TUI uses `scan_now()`, `requeue()`,
-    `exclude()` and `stop()` to control it. Requests from the TUI are queued and carried out
-    on the worker thread between runs.
+    In monitor mode (the default), scans only report which runs need uploading: runs are uploaded when
+    someone asks (`upload()`, or `upload_now()` from the command line). In auto mode (`auto_upload: true` in
+    the config, or `set_auto_upload()`), runs that need uploading are uploaded by themselves. A failed
+    automatic upload is tried again on later scans, up to `max_upload_attempts` uploads per run (default 3)
+    since the uploader started; after that it's left alone until someone asks for it to be uploaded.
 
-    A run whose upload fails is left PARTIAL (or ABSENT), so it's tried again on later scans, up to
-    `max_upload_attempts` uploads per run (default 3) since the uploader started. After that it's left
-    alone until it's re-queued, or the uploader is restarted.
+    In headless mode, `run()` is called on the main thread and Ctrl+C (KeyboardInterrupt) stops it.
+    In TUI mode, `run()` is called on a worker thread, and the TUI uses `scan_now()`, `upload()`,
+    `exclude()`, `set_auto_upload()` and `stop()` to control it. Requests from the TUI are queued and
+    carried out on the worker thread between runs.
     """
 
     def __init__(
@@ -81,13 +98,16 @@ class Uploader:
         # Uploads started for each run since the uploader started, reset when a run is uploaded or re-queued.
         self._upload_attempts: dict[str, int] = {}
         self._retries_exhausted_logged: set[str] = set()
-        # Runs re-queued to be uploaded again, even if they're already uploaded.
-        self._forced_uploads: set[str] = set()
+        # Uploads people have asked for: {run_id: UploadRequest}.
+        self._upload_requests: dict[str, UploadRequest] = {}
+        # Set for this session with set_auto_upload(); otherwise `auto_upload` in the config.
+        self._auto_upload_override: Optional[bool] = None
 
     def run(self):
         """
         Scan for runs and upload them, until `stop()` is called.
         """
+        log.info({"event_type": "upload_mode", "auto_upload": self.auto_upload})
         while not self._stop_event.is_set():
             self._wake_event.clear()
             self._handle_requests()
@@ -125,6 +145,8 @@ class Uploader:
     def _scan_and_upload(self):
         # Each destination is listed at most once per scan, the first time a run needs checking against it.
         remote_runs_by_destination: dict[tuple, Optional[dict[str, str]]] = {}
+        # In monitor mode: runs that need uploading, waiting for someone to ask.
+        awaiting_upload = []
         for run in core.scan(self.config):
             if self._stop_event.is_set():
                 break
@@ -152,41 +174,16 @@ class Uploader:
                 continue
             run['sequencer'] = sequencer
             try:
-                destinations = sequencer['destination_servers']
-                # States are keyed by label, which is unique per destination (unlike server_id).
-                labels = core.destination_labels(destinations)
-                destination_states = {}
-                for destination_server, label in zip(destinations, labels):
-                    remote_runs = self._remote_runs(destination_server, remote_runs_by_destination)
-                    if remote_runs is None:
-                        state = core.UNKNOWN
-                    else:
-                        state = remote_runs.get(run_id, core.ABSENT)
-                    destination_states[label] = state
+                destination_states = self._check_run(run, remote_runs_by_destination)
                 state = core.run_state(destination_states)
-                log.debug({
-                    "event_type": "run_checked",
-                    "sequencing_run_id": run_id,
-                    "state": state,
-                    "destinations": destination_states,
-                })
-
-                if run_id in self._forced_uploads:
-                    # Re-queued: upload again to every destination that can be reached, even if it's already there.
-                    to_upload = [d for d, label in zip(destinations, labels) if destination_states[label] != core.UNKNOWN]
-                    should_upload = bool(to_upload)
-                else:
-                    to_upload = [d for d, label in zip(destinations, labels) if destination_states[label] in (core.ABSENT, core.PARTIAL)]
-                    should_upload = bool(to_upload) and self._should_upload(run_id, state)
-
-                if should_upload:
-                    self._forced_uploads.discard(run_id)
-                    log.info({
-                        "event_type": "upload_starting",
-                        "sequencing_run_id": run_id,
-                        "server_ids": [core.destination_label(d, destinations) for d in to_upload],
-                    })
-                    self._upload_run(run, to_upload)
+                if run_id in self._upload_requests:
+                    self._handle_upload_request(run, destination_states)
+                elif self.auto_upload:
+                    to_upload = self._destinations_to_upload(run, destination_states, force=False)
+                    if to_upload and self._should_upload(run_id, state):
+                        self._start_upload(run, to_upload)
+                elif state in (core.ABSENT, core.PARTIAL):
+                    awaiting_upload.append(run_id)
             # A problem with one run shouldn't stop other runs from being checked.
             except OSError as e:
                 # Expected, environmental problems (missing files, permissions, network storage).
@@ -205,6 +202,110 @@ class Uploader:
                     "error": str(e)
                 }, exc_info=True)
             self._handle_requests()
+
+        if awaiting_upload:
+            log.info({
+                "event_type": "runs_awaiting_upload",
+                "num_runs": len(awaiting_upload),
+                "sequencing_run_ids": awaiting_upload,
+                "note": "Monitor mode: these runs aren't uploaded until someone asks (or auto_upload is turned on)",
+            })
+
+    def _handle_upload_request(self, run: dict[str, object], destination_states: dict[str, str]):
+        """
+        Carry out a requested upload, as far as the run's destinations can be checked. The request is kept
+        until every destination has been dealt with: destinations that can't be checked yet are uploaded to
+        on a later scan, once they can be. Each destination is only uploaded to once per request.
+        """
+        run_id = run['sequencing_run_id']
+        request = self._upload_requests[run_id]
+        destinations = run['sequencer']['destination_servers']
+        to_upload = [
+            d for d in self._destinations_to_upload(run, destination_states, request.force)
+            if core.destination_key(d) not in request.attempted
+        ]
+        if to_upload:
+            request.attempted.update(core.destination_key(d) for d in to_upload)
+            self._start_upload(run, to_upload)
+        waiting = [
+            label for d, label in zip(destinations, core.destination_labels(destinations))
+            if destination_states[label] == core.UNKNOWN and core.destination_key(d) not in request.attempted
+        ]
+        if waiting:
+            log.info({"event_type": "upload_request_waiting", "sequencing_run_id": run_id, "server_ids": waiting})
+            return
+        del self._upload_requests[run_id]
+        if not request.attempted:
+            log.info({"event_type": "upload_not_needed", "sequencing_run_id": run_id})
+
+    def _check_run(self, run: dict[str, object], cache: dict[tuple, Optional[dict[str, str]]]) -> dict[str, str]:
+        """
+        :return: The run's state on each of its sequencer's destinations: {label: core.UPLOADED etc.}, keyed by
+                 label (see `core.destination_labels`), which is unique per destination (unlike server_id).
+        """
+        destinations = run['sequencer']['destination_servers']
+        destination_states = {}
+        for destination_server, label in zip(destinations, core.destination_labels(destinations)):
+            remote_runs = self._remote_runs(destination_server, cache)
+            if remote_runs is None:
+                destination_states[label] = core.UNKNOWN
+            else:
+                destination_states[label] = remote_runs.get(run['sequencing_run_id'], core.ABSENT)
+        log.debug({
+            "event_type": "run_checked",
+            "sequencing_run_id": run['sequencing_run_id'],
+            "state": core.run_state(destination_states),
+            "destinations": destination_states,
+        })
+        return destination_states
+
+    @staticmethod
+    def _destinations_to_upload(run: dict[str, object], destination_states: dict[str, str], force: bool) -> list[dict[str, object]]:
+        """
+        :param force: Upload again even where the run's already uploaded.
+        :return: The destinations to upload the run to: where it's ABSENT or PARTIAL (or, with force,
+                 every destination that can be checked).
+        """
+        if force:
+            wanted = (core.ABSENT, core.PARTIAL, core.UPLOADED)
+        else:
+            wanted = (core.ABSENT, core.PARTIAL)
+        destinations = run['sequencer']['destination_servers']
+        return [d for d, label in zip(destinations, core.destination_labels(destinations)) if destination_states[label] in wanted]
+
+    def _start_upload(self, run: dict[str, object], destinations: list[dict[str, object]]) -> str:
+        log.info({
+            "event_type": "upload_starting",
+            "sequencing_run_id": run['sequencing_run_id'],
+            "server_ids": [core.destination_label(d, run['sequencer']['destination_servers']) for d in destinations],
+        })
+        return self._upload_run(run, destinations)
+
+    def upload_now(self, run_id: str, force: bool = False) -> str:
+        """
+        Upload one run straight away, on this thread (for the command line). Doesn't need `run()`.
+
+        :param run_id: The run to upload.
+        :param force: Upload again even where it's already uploaded.
+        :return: UPLOAD_COMPLETE, UPLOAD_INCOMPLETE_WITH_ERROR or UPLOAD_INCOMPLETE (see `core.upload_run`),
+                 ALREADY_UPLOADED, UNKNOWN if its destinations couldn't be checked, or SOME_DESTINATIONS_UNCHECKED
+                 if it was uploaded to every destination that could be checked, but at least one couldn't be.
+        :raises LookupError: If there's no complete run with that ID.
+        :raises ValueError: If the run is in the excluded runs list.
+        """
+        run = next((r for r in core.find_runs(self.config) if r['sequencing_run_id'] == run_id), None)
+        if run is None:
+            raise LookupError(f"No complete run called {run_id} was found in the sequencers' run output directories")
+        if run_id in self.config.get('excluded_runs', []):
+            raise ValueError(f"{run_id} is in the excluded runs list ({self.config.get('excluded_runs_list')})")
+        destination_states = self._check_run(run, {})
+        to_upload = self._destinations_to_upload(run, destination_states, force)
+        if not to_upload:
+            return 'ALREADY_UPLOADED' if core.run_state(destination_states) == core.UPLOADED else core.UNKNOWN
+        result = self._start_upload(run, to_upload)
+        if result == 'UPLOAD_COMPLETE' and core.UNKNOWN in destination_states.values():
+            return SOME_DESTINATIONS_UNCHECKED
+        return result
 
     def _remote_runs(self, destination_server: dict[str, object], cache: dict[tuple, Optional[dict[str, str]]]) -> Optional[dict[str, str]]:
         """
@@ -266,12 +367,37 @@ class Uploader:
         """
         self._wake_event.set()
 
-    def requeue(self, run_id: str):
+    def upload(self, run_id: str, force: bool = False):
         """
-        Upload a run again on the next scan (which starts now), even if it's already uploaded or has used up its attempts.
+        Upload a run on the next scan (which starts now, or as soon as the current one finishes), in either mode.
+        This also gives it a fresh set of attempts, if it's used them up in auto mode.
+
+        :param force: Upload again even where it's already uploaded (rewriting upload_complete.json).
         """
-        self._requests.put(('requeue', run_id))
+        self._requests.put(('reupload' if force else 'upload', run_id))
         self._wake_event.set()
+
+    @property
+    def auto_upload(self) -> bool:
+        """
+        :return: Whether runs are uploaded automatically (auto mode), rather than only when someone asks (monitor mode).
+        """
+        if self._auto_upload_override is not None:
+            return self._auto_upload_override
+        value = self.config.get('auto_upload', False)
+        if isinstance(value, str):
+            return value.strip().lower() in ('true', 'yes', '1')
+        return bool(value)
+
+    def set_auto_upload(self, enabled: bool):
+        """
+        Switch between auto and monitor mode, for this session (the config sets the mode at startup).
+        Switching to auto mode starts a scan.
+        """
+        self._auto_upload_override = enabled
+        log.info({"event_type": "upload_mode", "auto_upload": enabled})
+        if enabled:
+            self._wake_event.set()
 
     def exclude(self, run_id: str):
         """
@@ -311,7 +437,7 @@ class Uploader:
             if process is not None and self._stop_event.is_set():
                 process.terminate()
 
-    def _upload_run(self, run: dict[str, object], destinations: list[dict[str, object]]):
+    def _upload_run(self, run: dict[str, object], destinations: list[dict[str, object]]) -> str:
         run_id = run['sequencing_run_id']
         rsync_stderr = tempfile.TemporaryFile(mode='w+') if self.capture_rsync_stderr else None
         self._uploading_run_id = run_id
@@ -328,6 +454,7 @@ class Uploader:
             )
             if status == 'UPLOAD_COMPLETE':
                 self._forget_attempts(run_id)
+            return status
         finally:
             self._set_rsync_process(None)
             self._uploading_run_id = None
@@ -354,10 +481,13 @@ class Uploader:
             except queue.Empty:
                 return
             try:
-                if request == 'requeue':
+                if request in ('upload', 'reupload'):
                     self._forget_attempts(run_id)
-                    self._forced_uploads.add(run_id)
-                    log.info({"event_type": "run_requeued", "sequencing_run_id": run_id})
+                    force = request == 'reupload'
+                    # A new request starts afresh, but doesn't undo an earlier forced one.
+                    earlier = self._upload_requests.get(run_id)
+                    self._upload_requests[run_id] = UploadRequest(force=force or (earlier is not None and earlier.force))
+                    log.info({"event_type": "upload_requested", "sequencing_run_id": run_id, "force": force})
                 elif request == 'exclude':
                     self._exclude_run(run_id)
             except Exception as e:

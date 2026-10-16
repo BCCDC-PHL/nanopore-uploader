@@ -45,7 +45,7 @@ STATUS_DISPLAY = {
     core.PARTIAL: ("◐ Partly uploaded", "dark_orange"),
     core.UPLOADED: ("✓ Uploaded", "green"),
     core.UNKNOWN: ("? Can't check server", "magenta"),
-    QUEUED: ("◷ Queued to upload again", "yellow"),
+    QUEUED: ("◷ Queued for upload", "bold yellow"),
     UPLOAD_FAILED: ("✗ Failed", "bold red"),
     EXCLUDED: ("– Excluded", "dim"),
 }
@@ -71,6 +71,7 @@ QUIET_EVENTS = {
     'found_run',
     'scan_started',
     'remote_runs_listed',
+    'runs_awaiting_upload',
     'upload_started',
     'upload_progress_update',
     'upload_complete_file_written',
@@ -290,7 +291,8 @@ class UploaderApp(App):
 
     BINDINGS = [
         Binding("s", "scan_now", "Scan now"),
-        Binding("r", "requeue", "Re-queue run"),
+        Binding("u", "upload", "Upload run"),
+        Binding("a", "toggle_auto_upload", "Auto mode on/off"),
         Binding("x", "exclude", "Exclude run"),
         Binding("l", "toggle_log", "Log: activity/all"),
         Binding("q", "request_quit", "Quit"),
@@ -478,6 +480,9 @@ class UploaderApp(App):
             # A failed upload leaves the run partly uploaded (or not at all). Keep showing that it failed until it's retried.
             if run is not None and run.status == UPLOAD_FAILED and state in (core.ABSENT, core.PARTIAL):
                 state = None
+            # A requested upload waits while the destination can't be checked. Keep showing that it's queued.
+            if run is not None and run.status == QUEUED and state == core.UNKNOWN:
+                state = None
             self._update_run(run_id, touch=False, status=state, destinations=dict(payload.get('destinations') or {}))
         elif event_type == 'upload_starting':
             self.state = "uploading"
@@ -513,7 +518,7 @@ class UploaderApp(App):
             if run_id == self.active_upload_run_id:
                 self._finish_upload(run_id, None)
                 self._update_run(run_id, touch=True)
-        elif event_type == 'run_requeued':
+        elif event_type == 'upload_requested':
             self._update_run(run_id, status=QUEUED, last_error="")
         elif event_type == 'upload_retries_exhausted' and run_id in self.runs:
             run = self.runs[run_id]
@@ -574,27 +579,51 @@ class UploaderApp(App):
 
     # ---- Status line ----
 
+    def _ready_to_upload(self) -> list[RunInfo]:
+        """
+        :return: Runs found on the sequencer that aren't (fully) uploaded yet.
+        """
+        return [
+            run for run in self.runs.values()
+            if run.run_directory and run.status in (core.ABSENT, core.PARTIAL, UPLOAD_FAILED)
+        ]
+
     def _refresh_status(self):
         status = self.query_one("#status", Static)
+        # Styled with append(): a style passed to Text() would apply to the rest of the line too.
+        line = Text()
+        if self.uploader.auto_upload:
+            line.append(" AUTO ", style="bold black on green")
+        else:
+            line.append(" MONITOR ", style="bold black on yellow")
+        line.append(" ")
+        line.append_text(self._status_text())
+        status.update(line)
+
+    def _status_text(self) -> Text:
         if self.stopping:
-            status.update(Text("■ Stopping…", style="yellow"))
+            return Text("■ Stopping…", style="yellow")
         elif self.state == "starting":
-            status.update(Text("Starting…"))
+            return Text("Starting…")
         elif self.state == "scanning":
-            status.update(Text("⟳ Scanning for completed runs…", style="cyan"))
+            return Text("⟳ Scanning for completed runs…", style="cyan")
         elif self.state == "uploading":
-            status.update(Text(f"● Uploading {self.active_upload_run_id}", style="bold cyan"))
+            return Text(f"● Uploading {self.active_upload_run_id}", style="bold cyan")
         elif self.state == "idle":
             text = Text("✓ Idle", style="green")
+            ready = len(self._ready_to_upload())
+            if ready and not self.uploader.auto_upload:
+                text.append(f" · {ready} run{'s' if ready != 1 else ''} ready to upload (select and press u)", style="bold yellow")
             if self.next_scan_at is not None:
                 remaining = max(0, int((self.next_scan_at - datetime.datetime.now()).total_seconds()))
                 hours, rest = divmod(remaining, 3600)
                 minutes, seconds = divmod(rest, 60)
                 countdown = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
                 text.append(f" · next scan in {countdown} (at {self.next_scan_at:%H:%M:%S})", style="default")
-            status.update(text)
+            return text
         elif self.state == "error":
-            status.update(Text("✗ Uploader stopped: unexpected error (see log). Press q to quit.", style="bold red"))
+            return Text("✗ Uploader stopped: unexpected error (see log). Press q to quit.", style="bold red")
+        return Text()
 
     # ---- Log panel ----
 
@@ -634,11 +663,19 @@ class UploaderApp(App):
         if event_type == 'upload_complete':
             return f"Upload complete: {run_id}"
         if event_type == 'upload_cancelled':
-            return f"Upload stopped: {run_id} (partly uploaded; it'll be resumed later)"
+            return f"Upload stopped: {run_id} (partly uploaded; uploading it again picks up where it left off)"
         if event_type == 'upload_failed':
             return f"Upload failed: {run_id}: {payload.get('error_type')}: {payload.get('error')}"
-        if event_type == 'run_requeued':
-            return f"Re-queued for upload: {run_id}"
+        if event_type == 'upload_requested':
+            return f"Queued for upload{' again' if payload.get('force') else ''}: {run_id}"
+        if event_type == 'upload_request_waiting':
+            return f"Waiting to upload {run_id} to {', '.join(payload.get('server_ids') or [])}, which can't be checked right now"
+        if event_type == 'upload_not_needed':
+            return f"Not uploading {run_id}: it's already uploaded"
+        if event_type == 'upload_mode':
+            if payload.get('auto_upload'):
+                return "Auto mode: runs that aren't uploaded yet are uploaded automatically. Press a for monitor mode."
+            return "Monitor mode: runs are only uploaded when you select one and press u. Press a for auto mode."
         if event_type == 'run_excluded':
             return f"Excluded from upload: {run_id}"
         if event_type == 'rsync_stderr':
@@ -700,7 +737,7 @@ class UploaderApp(App):
             self.notify("A scan is already running. Another will start as soon as it finishes.")
         self.uploader.scan_now()
 
-    def action_requeue(self):
+    def action_upload(self):
         run = self._selected_run()
         if run is None or self.stopping:
             return
@@ -708,25 +745,58 @@ class UploaderApp(App):
             self.notify("That run is uploading now.", severity="warning")
             return
         if run.status == EXCLUDED:
-            self.notify(
-                "That run is in the excluded runs list. Remove it from the list first.",
-                severity="warning",
+            self.notify("That run is in the excluded runs list. Remove it from the list first.", severity="warning")
+            return
+        if not run.run_directory:
+            self.notify("That run hasn't been found on the sequencer by a scan yet.", severity="warning")
+            return
+
+        destinations = run.destinations or {}
+        already_uploaded = run.status == core.UPLOADED or (bool(destinations) and set(destinations.values()) == {core.UPLOADED})
+
+        def confirmed(answer: bool):
+            if answer:
+                self.uploader.upload(run.sequencing_run_id, force=already_uploaded)
+                self.notify(f"Queued {run.sequencing_run_id} for upload")
+
+        if already_uploaded:
+            question = (
+                f"{run.sequencing_run_id} is already uploaded. Upload it again?\n\n"
+                "rsync only copies files that are missing or changed, but upload_complete.json is rewritten, "
+                "which may start downstream processing again."
             )
+            self.push_screen(ConfirmScreen(question, yes_label="Upload again", danger=True), confirmed)
+        else:
+            needed = [server for server, state in destinations.items() if state in (core.ABSENT, core.PARTIAL)]
+            question = f"Upload {run.sequencing_run_id}" + (f" to {', '.join(needed)}?" if needed else "?")
+            if core.UNKNOWN in destinations.values():
+                question += "\n\nA destination can't be checked right now, so the upload will wait until it can."
+            self.push_screen(ConfirmScreen(question, yes_label="Upload"), confirmed)
+
+    def action_toggle_auto_upload(self):
+        if self.stopping or self.state == "error":
+            return
+        if self.uploader.auto_upload:
+            self.uploader.set_auto_upload(False)
+            self._refresh_status()
             return
 
         def confirmed(answer: bool):
             if answer:
-                self.uploader.requeue(run.sequencing_run_id)
-                self.notify(f"Re-queued {run.sequencing_run_id}")
+                self.uploader.set_auto_upload(True)
+                self._refresh_status()
 
-        question = f"Upload {run.sequencing_run_id} again?\n\nrsync only copies files that are missing or changed on the destination."
-        already_uploaded = run.status == core.UPLOADED or core.UPLOADED in (run.destinations or {}).values()
-        if already_uploaded:
-            question += (
-                "\n\nIt's already uploaded. Uploading it again rewrites upload_complete.json, "
-                "which may start downstream processing again."
-            )
-        self.push_screen(ConfirmScreen(question, yes_label="Re-queue", danger=already_uploaded), confirmed)
+        ready = len(self._ready_to_upload())
+        self.push_screen(
+            ConfirmScreen(
+                "Switch to auto mode?\n\n"
+                "Runs that aren't uploaded yet will be uploaded automatically"
+                + (f", starting with the {ready} ready now." if ready else ".")
+                + "\n\nThis lasts until the uploader is restarted. Set auto_upload in the config to change the default.",
+                yes_label="Auto mode",
+            ),
+            confirmed,
+        )
 
     def action_exclude(self):
         run = self._selected_run()
@@ -771,7 +841,7 @@ class UploaderApp(App):
             self.push_screen(
                 ConfirmScreen(
                     f"An upload is in progress ({uploading_run_id}).\n\n"
-                    "Quitting will stop it. The run will be left partly uploaded, and resumed the next time the uploader runs.",
+                    "Quitting will stop it. The run will be left partly uploaded; uploading it again picks up where it left off.",
                     yes_label="Stop upload and quit",
                     danger=True,
                 ),

@@ -29,6 +29,11 @@ def tui_handler():
     root.setLevel(previous_level)
 
 
+def auto_mode(config):
+    config["auto_upload"] = True
+    save_config(config)
+
+
 async def wait_until(pilot, condition, timeout: float = 10.0):
     for _ in range(int(timeout / 0.05)):
         if condition():
@@ -41,6 +46,7 @@ def test_runs_table_follows_uploads(config, run_output_dir, destination_dir, fak
     make_run(run_output_dir, GRIDION_RUN_ID)
     make_run(run_output_dir, GRIDION_RUN_ID_2, sample_id="sample-02")
     mark_uploaded(destination_dir, GRIDION_RUN_ID_2)
+    auto_mode(config)
     excluded_run_id = "20261001_0000_X1_FAZ00000_00000000"
     with open(config['excluded_runs_list'], 'w') as f:
         f.write(excluded_run_id + "\n")
@@ -74,6 +80,7 @@ def test_runs_table_follows_uploads(config, run_output_dir, destination_dir, fak
 
 def test_failed_upload_shows_the_error(config, run_output_dir, fake_rsync, fake_ssh, tui_handler, monkeypatch):
     make_run(run_output_dir, GRIDION_RUN_ID)
+    auto_mode(config)
     monkeypatch.setenv("FAKE_RSYNC_FAIL", "archive.example.org")
     monkeypatch.setenv("FAKE_RSYNC_EXIT_CODE", "255")
 
@@ -96,6 +103,7 @@ def test_failed_upload_shows_the_error(config, run_output_dir, fake_rsync, fake_
 
 def test_quitting_during_an_upload_asks_first(config, run_output_dir, fake_rsync, fake_ssh, tui_handler, monkeypatch):
     make_run(run_output_dir, GRIDION_RUN_ID)
+    auto_mode(config)
     monkeypatch.setenv("FAKE_RSYNC_SLEEP", "30")
 
     async def scenario():
@@ -121,7 +129,7 @@ def test_run_isnt_shown_as_uploaded_while_a_destination_cant_be_checked(config, 
     unreachable = make_destination(tmp_path, "offline-archive")
     unreachable["destination_dir"] = str(tmp_path / "not-mounted")
     config["sequencers"][0]["destination_servers"].append(unreachable)
-    save_config(config)
+    auto_mode(config)
 
     async def scenario():
         app = UploaderApp(config["_path"], config, tui_handler)
@@ -137,3 +145,61 @@ def test_run_isnt_shown_as_uploaded_while_a_destination_cant_be_checked(config, 
     # Uploaded to the reachable destination, but not known to be on the other.
     assert destinations == {"archive": core.UPLOADED, "offline-archive": core.UNKNOWN}
     assert status == core.UNKNOWN
+
+
+def test_monitor_mode_uploads_when_asked(config, run_output_dir, destination_dir, fake_rsync, fake_ssh, tui_handler):
+    make_run(run_output_dir, GRIDION_RUN_ID)
+    make_run(run_output_dir, GRIDION_RUN_ID_2, sample_id="sample-02")
+
+    async def scenario():
+        app = UploaderApp(config["_path"], config, tui_handler)
+        async with app.run_test(size=(150, 40)) as pilot:
+            await wait_until(pilot, lambda: app.state == "idle")
+            before = {run_id: run.status for run_id, run in app.runs.items()}
+            status_line = str(app.query_one("#status").render())
+            table = app.query_one("#runs")
+            table.move_cursor(row=table.get_row_index(GRIDION_RUN_ID))
+            await pilot.press("u")
+            await pilot.pause(0.2)
+            asked = type(app.screen).__name__
+            await pilot.press("y")
+            await wait_until(pilot, lambda: app.runs[GRIDION_RUN_ID].status == core.UPLOADED)
+            after = {run_id: run.status for run_id, run in app.runs.items()}
+            await pilot.press("q")
+        return before, status_line, asked, after
+
+    before, status_line, asked, after = asyncio.run(scenario())
+
+    assert before == {GRIDION_RUN_ID: core.ABSENT, GRIDION_RUN_ID_2: core.ABSENT}
+    assert "MONITOR" in status_line
+    assert "2 runs ready to upload" in status_line
+    assert asked == "ConfirmScreen"
+    assert after == {GRIDION_RUN_ID: core.UPLOADED, GRIDION_RUN_ID_2: core.ABSENT}
+    assert [args[-2].rsplit("/", 1)[-1] for args in fake_rsync.calls()] == [GRIDION_RUN_ID]
+
+
+def test_switching_to_auto_mode_asks_first(config, run_output_dir, fake_rsync, fake_ssh, tui_handler):
+    make_run(run_output_dir, GRIDION_RUN_ID)
+
+    async def scenario():
+        app = UploaderApp(config["_path"], config, tui_handler)
+        async with app.run_test(size=(150, 40)) as pilot:
+            await wait_until(pilot, lambda: app.state == "idle")
+            await pilot.press("a")
+            await pilot.pause(0.2)
+            asked = type(app.screen).__name__
+            await pilot.press("y")
+            await wait_until(pilot, lambda: app.runs[GRIDION_RUN_ID].status == core.UPLOADED)
+            status_line = str(app.query_one("#status").render())
+            # Switching back to monitor mode doesn't need asking.
+            await pilot.press("a")
+            await pilot.pause(0.1)
+            auto_after = app.uploader.auto_upload
+            await pilot.press("q")
+        return asked, status_line, auto_after
+
+    asked, status_line, auto_after = asyncio.run(scenario())
+
+    assert asked == "ConfirmScreen"
+    assert "AUTO" in status_line
+    assert auto_after is False
