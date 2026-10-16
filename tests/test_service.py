@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import nanopore_uploader.core as core
-from nanopore_uploader.service import Uploader
+from nanopore_uploader.service import SOME_DESTINATIONS_UNCHECKED, Uploader
 
 from conftest import GRIDION_RUN_ID, GRIDION_RUN_ID_2, make_destination, make_run, mark_partial, mark_uploaded, save_config
 
@@ -457,6 +457,88 @@ class TestMonitorMode:
         scan_once(uploader)
 
         assert uploads() == []
+
+
+class TestRequestsWithAnUncheckedDestination:
+    """
+    A requested upload is kept until every destination has been dealt with, including ones that can't be
+    checked at first, without uploading to any destination twice.
+    """
+
+    @pytest.fixture
+    def offline(self, config, tmp_path):
+        offline = make_destination(tmp_path, 'offline-archive')
+        offline_dir = Path(offline['destination_dir'])
+        offline_dir.rmdir()  # can't be listed until it's back
+        config['sequencers'][0]['destination_servers'].append(offline)
+        save_config(config)
+        return offline_dir
+
+    @staticmethod
+    def uploaded_to(fake_rsync):
+        return [args[-1].split('@')[1].split('.')[0] for args in fake_rsync.calls()]
+
+    def test_request_waits_for_the_unchecked_destination(self, config, run_output_dir, offline, fake_rsync, fake_ssh, caplog):
+        caplog.set_level('INFO')
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config, auto_upload=False)
+
+        uploader.upload(GRIDION_RUN_ID)
+        scan_once(uploader)
+        assert self.uploaded_to(fake_rsync) == ['archive']
+        assert events(caplog, 'upload_request_waiting')[-1]['server_ids'] == ['offline-archive']
+
+        scan_once(uploader)  # still offline
+        assert self.uploaded_to(fake_rsync) == ['archive']
+
+        offline.mkdir()
+        scan_once(uploader)
+        scan_once(uploader)
+
+        assert self.uploaded_to(fake_rsync) == ['archive', 'offline-archive']
+        assert GRIDION_RUN_ID not in uploader._upload_requests
+
+    def test_forced_request_doesnt_upload_anywhere_twice(self, config, run_output_dir, destination_dir, offline, fake_rsync, fake_ssh):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        mark_uploaded(destination_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config, auto_upload=False)
+
+        uploader.upload(GRIDION_RUN_ID, force=True)
+        scan_once(uploader)
+        scan_once(uploader)  # still offline: 'archive' isn't rewritten again
+        assert self.uploaded_to(fake_rsync) == ['archive']
+
+        offline.mkdir()
+        mark_uploaded(offline, GRIDION_RUN_ID)
+        scan_once(uploader)
+        scan_once(uploader)
+
+        assert self.uploaded_to(fake_rsync) == ['archive', 'offline-archive']
+
+    def test_asking_again_starts_afresh(self, config, run_output_dir, offline, fake_rsync, fake_ssh):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        uploader = make_uploader(config, auto_upload=False)
+        uploader.upload(GRIDION_RUN_ID, force=True)
+        scan_once(uploader)
+
+        uploader.upload(GRIDION_RUN_ID, force=True)
+        scan_once(uploader)
+
+        assert self.uploaded_to(fake_rsync) == ['archive', 'archive']
+
+    def test_upload_now_doesnt_report_success(self, config, run_output_dir, offline, fake_rsync, fake_ssh):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+
+        result = make_uploader(config).upload_now(GRIDION_RUN_ID)
+
+        assert result == SOME_DESTINATIONS_UNCHECKED
+        assert self.uploaded_to(fake_rsync) == ['archive']
+
+    def test_upload_now_still_reports_failures(self, config, run_output_dir, offline, fake_rsync, fake_ssh, monkeypatch):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        monkeypatch.setenv('FAKE_RSYNC_FAIL', 'archive.example.org')
+
+        assert make_uploader(config).upload_now(GRIDION_RUN_ID) == 'UPLOAD_INCOMPLETE_WITH_ERROR'
 
 
 class TestUploadNow:

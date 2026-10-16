@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import threading
 
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import paramiko
@@ -15,6 +16,9 @@ from nanopore_uploader.config import load_config
 
 DEFAULT_SCAN_INTERVAL_SECONDS = 3600.0
 DEFAULT_MAX_UPLOAD_ATTEMPTS = 3
+
+# upload_now() result: uploaded wherever it could be checked, but at least one destination couldn't be.
+SOME_DESTINATIONS_UNCHECKED = 'SOME_DESTINATIONS_UNCHECKED'
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +39,17 @@ def reload_config(config_path: os.PathLike, current_config: dict[str, object]) -
     except Exception as e:
         log.error({"event_type": "load_config_failed", "config_file": os.path.abspath(config_path), "error": str(e)})
         return current_config
+
+
+@dataclass
+class UploadRequest:
+    """
+    An upload someone has asked for.
+    """
+    # Upload again even where the run's already uploaded (rewriting upload_complete.json).
+    force: bool = False
+    # Destinations (core.destination_key) already uploaded to for this request.
+    attempted: set = field(default_factory=set)
 
 
 class Uploader:
@@ -83,8 +98,8 @@ class Uploader:
         # Uploads started for each run since the uploader started, reset when a run is uploaded or re-queued.
         self._upload_attempts: dict[str, int] = {}
         self._retries_exhausted_logged: set[str] = set()
-        # Uploads people have asked for: {run_id: force}. With force, a run is uploaded again even where it's already uploaded.
-        self._upload_requests: dict[str, bool] = {}
+        # Uploads people have asked for: {run_id: UploadRequest}.
+        self._upload_requests: dict[str, UploadRequest] = {}
         # Set for this session with set_auto_upload(); otherwise `auto_upload` in the config.
         self._auto_upload_override: Optional[bool] = None
 
@@ -162,15 +177,7 @@ class Uploader:
                 destination_states = self._check_run(run, remote_runs_by_destination)
                 state = core.run_state(destination_states)
                 if run_id in self._upload_requests:
-                    force = self._upload_requests[run_id]
-                    to_upload = self._destinations_to_upload(run, destination_states, force)
-                    if to_upload:
-                        del self._upload_requests[run_id]
-                        self._start_upload(run, to_upload)
-                    elif state == core.UPLOADED:
-                        del self._upload_requests[run_id]
-                        log.info({"event_type": "upload_not_needed", "sequencing_run_id": run_id})
-                    # Otherwise its destinations can't be checked yet: keep the request for the next scan.
+                    self._handle_upload_request(run, destination_states)
                 elif self.auto_upload:
                     to_upload = self._destinations_to_upload(run, destination_states, force=False)
                     if to_upload and self._should_upload(run_id, state):
@@ -203,6 +210,33 @@ class Uploader:
                 "sequencing_run_ids": awaiting_upload,
                 "note": "Monitor mode: these runs aren't uploaded until someone asks (or auto_upload is turned on)",
             })
+
+    def _handle_upload_request(self, run: dict[str, object], destination_states: dict[str, str]):
+        """
+        Carry out a requested upload, as far as the run's destinations can be checked. The request is kept
+        until every destination has been dealt with: destinations that can't be checked yet are uploaded to
+        on a later scan, once they can be. Each destination is only uploaded to once per request.
+        """
+        run_id = run['sequencing_run_id']
+        request = self._upload_requests[run_id]
+        destinations = run['sequencer']['destination_servers']
+        to_upload = [
+            d for d in self._destinations_to_upload(run, destination_states, request.force)
+            if core.destination_key(d) not in request.attempted
+        ]
+        if to_upload:
+            request.attempted.update(core.destination_key(d) for d in to_upload)
+            self._start_upload(run, to_upload)
+        waiting = [
+            label for d, label in zip(destinations, core.destination_labels(destinations))
+            if destination_states[label] == core.UNKNOWN and core.destination_key(d) not in request.attempted
+        ]
+        if waiting:
+            log.info({"event_type": "upload_request_waiting", "sequencing_run_id": run_id, "server_ids": waiting})
+            return
+        del self._upload_requests[run_id]
+        if not request.attempted:
+            log.info({"event_type": "upload_not_needed", "sequencing_run_id": run_id})
 
     def _check_run(self, run: dict[str, object], cache: dict[tuple, Optional[dict[str, str]]]) -> dict[str, str]:
         """
@@ -254,7 +288,8 @@ class Uploader:
         :param run_id: The run to upload.
         :param force: Upload again even where it's already uploaded.
         :return: UPLOAD_COMPLETE, UPLOAD_INCOMPLETE_WITH_ERROR or UPLOAD_INCOMPLETE (see `core.upload_run`),
-                 or ALREADY_UPLOADED, or UNKNOWN if its destinations couldn't be checked.
+                 ALREADY_UPLOADED, UNKNOWN if its destinations couldn't be checked, or SOME_DESTINATIONS_UNCHECKED
+                 if it was uploaded to every destination that could be checked, but at least one couldn't be.
         :raises LookupError: If there's no complete run with that ID.
         :raises ValueError: If the run is in the excluded runs list.
         """
@@ -267,7 +302,10 @@ class Uploader:
         to_upload = self._destinations_to_upload(run, destination_states, force)
         if not to_upload:
             return 'ALREADY_UPLOADED' if core.run_state(destination_states) == core.UPLOADED else core.UNKNOWN
-        return self._start_upload(run, to_upload)
+        result = self._start_upload(run, to_upload)
+        if result == 'UPLOAD_COMPLETE' and core.UNKNOWN in destination_states.values():
+            return SOME_DESTINATIONS_UNCHECKED
+        return result
 
     def _remote_runs(self, destination_server: dict[str, object], cache: dict[tuple, Optional[dict[str, str]]]) -> Optional[dict[str, str]]:
         """
@@ -446,8 +484,9 @@ class Uploader:
                 if request in ('upload', 'reupload'):
                     self._forget_attempts(run_id)
                     force = request == 'reupload'
-                    # Don't let a later plain request undo an earlier forced one.
-                    self._upload_requests[run_id] = self._upload_requests.get(run_id, False) or force
+                    # A new request starts afresh, but doesn't undo an earlier forced one.
+                    earlier = self._upload_requests.get(run_id)
+                    self._upload_requests[run_id] = UploadRequest(force=force or (earlier is not None and earlier.force))
                     log.info({"event_type": "upload_requested", "sequencing_run_id": run_id, "force": force})
                 elif request == 'exclude':
                     self._exclude_run(run_id)

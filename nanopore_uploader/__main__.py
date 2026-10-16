@@ -29,6 +29,10 @@ UPLOAD_NOW_MESSAGES = {
     'UPLOAD_INCOMPLETE_WITH_ERROR': "Uploading {run_id} failed. See the log for details.",
     'UPLOAD_INCOMPLETE': "Uploading {run_id} was stopped. It's partly uploaded, and will be resumed by the next upload.",
     'UNKNOWN': "{run_id} wasn't uploaded, because its destination(s) couldn't be checked. See the log for details.",
+    'SOME_DESTINATIONS_UNCHECKED': (
+        "{run_id} was uploaded to every destination that could be checked, but at least one couldn't be. "
+        "See the log for details, and run this again once it can be checked."
+    ),
 }
 
 

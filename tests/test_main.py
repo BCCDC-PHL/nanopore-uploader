@@ -8,7 +8,7 @@ import pytest
 import nanopore_uploader.core as core
 from nanopore_uploader.__main__ import main
 
-from conftest import GRIDION_RUN_ID, make_run, mark_uploaded
+from conftest import GRIDION_RUN_ID, make_destination, make_run, mark_uploaded, save_config
 
 
 @pytest.fixture
@@ -80,6 +80,18 @@ class TestUploadOneRun:
 
         with pytest.raises(SystemExit, match="failed"):
             main(["-c", config["_path"], "--upload", GRIDION_RUN_ID])
+
+    def test_a_destination_that_cant_be_checked_isnt_success(self, config, run_output_dir, tmp_path, fake_rsync, fake_ssh, started):
+        make_run(run_output_dir, GRIDION_RUN_ID)
+        offline = make_destination(tmp_path, "offline-archive")
+        offline["destination_dir"] = str(tmp_path / "not-mounted")
+        config["sequencers"][0]["destination_servers"].append(offline)
+        save_config(config)
+
+        with pytest.raises(SystemExit, match="couldn't be"):
+            main(["-c", config["_path"], "--upload", GRIDION_RUN_ID])
+
+        assert len(fake_rsync.calls()) == 1
 
     def test_unknown_run(self, config, fake_rsync, fake_ssh, started):
         with pytest.raises(SystemExit, match="No complete run"):

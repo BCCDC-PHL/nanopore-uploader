@@ -668,6 +668,8 @@ class UploaderApp(App):
             return f"Upload failed: {run_id}: {payload.get('error_type')}: {payload.get('error')}"
         if event_type == 'upload_requested':
             return f"Queued for upload{' again' if payload.get('force') else ''}: {run_id}"
+        if event_type == 'upload_request_waiting':
+            return f"Waiting to upload {run_id} to {', '.join(payload.get('server_ids') or [])}, which can't be checked right now"
         if event_type == 'upload_not_needed':
             return f"Not uploading {run_id}: it's already uploaded"
         if event_type == 'upload_mode':
