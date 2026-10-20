@@ -1,32 +1,61 @@
-import datetime
+from dataclasses import dataclass, field, fields
+from datetime import datetime
+from enum import StrEnum
+from pathlib import Path
+from typing import Optional
 
-from sqlalchemy import Column
-from sqlalchemy import ForeignKey
-from sqlalchemy import Boolean
-from sqlalchemy import Integer
-from sqlalchemy import Float
-from sqlalchemy import String
-from sqlalchemy import Date
-from sqlalchemy import DateTime
-from sqlalchemy import JSON
 
-from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import relationship
 
-Base = declarative_base()
+@dataclass
+class Config:
+    """
+    Main application config.
+    """
+    scan_interval_seconds: float = 3600
+    notification: dict = field(default_factory=dict)
+    sequencers: list = field(default_factory=list)
+    excluded_runs_list: Optional[Path] = None
+    excluded_runs: list[str] = field(default_factory=list)
 
-class SequencingRun(Base):
-    __tablename__ = 'sequencing_run'
+    def __post_init__(self):
+        self.scan_interval_seconds = float(self.scan_interval_seconds)
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    sequencing_run_id = Column(String)
-    protocol_group_id = Column(String)
-    instrument_type = Column(String)
-    instrument_id = Column(String)
-    run_date = Column(Date)
-    run_directory = Column(String)
-    status = Column(String)
-    timestamp_upload_start = Column(String)
-    timestamp_upload_complete = Column(String)
-    upload_percent_complete = Column(Float, default=0.0)
-    timestamp_updated = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
+    @classmethod
+    def from_dict(cls, data: dict):
+        # Get all valid field names for this dataclass
+        valid_fields = {f.name for f in fields(cls)}
+        # Filter the input dictionary
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
+
+
+class InstrumentType(StrEnum):
+    """
+    Instrument type ('gridion', 'promethion' or 'unknown')
+    """
+    gridion   = "gridion"
+    promethion = "promethion"
+    unknown = "unknown"
+
+
+class UploadStatus(StrEnum):
+    QUEUED_FOR_UPLOAD = "QUEUED_FOR_UPLOAD"
+    UPLOAD_STARTED = "UPLOAD_STARTED"
+    UPLOAD_COMPLETE = "UPLOAD_COMPLETE"
+    UPLOAD_INCOMPLETE = "UPLOAD_INCOMPLETE"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass
+class SequencingRun():
+    sequencing_run_id: str
+    protocol_group_id: str
+    instrument_type: InstrumentType
+    instrument_id: str
+    run_date: datetime.date
+    run_directory: Path
+    status: UploadStatus
+    timestamp_upload_start: Optional[datetime] = None
+    timestamp_upload_complete: Optional[datetime] = None
+    upload_percent_complete: float = 0.0
+    timestamp_updated: datetime = field(default_factory=datetime.now)

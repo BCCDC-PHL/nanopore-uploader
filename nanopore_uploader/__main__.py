@@ -1,85 +1,113 @@
 #!/usr/bin/env python
 
 import argparse
-import datetime
-import json
 import logging
-import os
-import time
+import sys
 
-import nanopore_uploader.config
-import nanopore_uploader.core as core
+from nanopore_uploader.config import load_config
+from nanopore_uploader.logging_config import configure_logging
+from nanopore_uploader.service import Uploader
 
-DEFAULT_SCAN_INTERVAL_SECONDS = 3600.0
+log = logging.getLogger(__name__)
 
-def main():
+
+def note_unused_settings(config: dict[str, object]):
+    """
+    Log a note about settings from earlier versions that are no longer used.
+    """
+    if 'db' in config:
+        log.info({
+            "event_type": "config_setting_unused",
+            "setting": "db",
+            "note": "Upload state now comes from each destination's upload_complete.json files, so the db file isn't used",
+        })
+
+
+UPLOAD_NOW_MESSAGES = {
+    'UPLOAD_COMPLETE': "Uploaded {run_id}",
+    'ALREADY_UPLOADED': "{run_id} is already uploaded to every destination. Use --force to upload it again (this rewrites upload_complete.json).",
+    'UPLOAD_INCOMPLETE_WITH_ERROR': "Uploading {run_id} failed. See the log for details.",
+    'UPLOAD_INCOMPLETE': "Uploading {run_id} was stopped. It's partly uploaded, and will be resumed by the next upload.",
+    'UNKNOWN': "{run_id} wasn't uploaded, because its destination(s) couldn't be checked. See the log for details.",
+    'SOME_DESTINATIONS_UNCHECKED': (
+        "{run_id} was uploaded to every destination that could be checked, but at least one couldn't be. "
+        "See the log for details, and run this again once it can be checked."
+    ),
+}
+
+
+def upload_now(uploader: Uploader, run_id: str, force: bool):
+    """
+    Upload one run, then exit: 0 if it's uploaded, 1 otherwise.
+    """
+    try:
+        result = uploader.upload_now(run_id, force=force)
+    except (LookupError, ValueError) as e:
+        sys.exit(f"Error: {e}")
+    except KeyboardInterrupt:
+        log.info({"event_type": "quit"})
+        sys.exit(f"Stopped. {run_id} is partly uploaded, and will be resumed by the next upload.")
+    message = UPLOAD_NOW_MESSAGES.get(result, "{run_id}: " + result).format(run_id=run_id)
+    if result in ('UPLOAD_COMPLETE', 'ALREADY_UPLOADED'):
+        print(message)
+    else:
+        sys.exit(f"Error: {message}")
+
+
+def main(argv: list[str] = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('-c', '--config')
-    parser.add_argument('--log-level')
-    args = parser.parse_args()
+    parser.add_argument('-c', '--config', required=True)
+    parser.add_argument('--log-level', default='info', choices=['debug', 'info', 'warning', 'error'])
+    parser.add_argument('--log-file', help='Append logs to this file, rotated daily at midnight (default: log to stdout)')
+    parser.add_argument('--log-retention-days', type=int, default=90, help='Number of rotated log files to keep. 0 keeps all of them (default: 90)')
+    parser.add_argument('--log-format', default='json', choices=['json', 'text'])
+    parser.add_argument('--tui', action='store_true', help='Show an interactive terminal dashboard instead of writing logs to stdout')
+    parser.add_argument('--upload', metavar='RUN_ID', help="Upload one run to its destinations where it isn't already uploaded, then exit")
+    parser.add_argument('--force', action='store_true', help="With --upload: upload again even where it's already uploaded (rewrites upload_complete.json)")
+    args = parser.parse_args(argv)
+    if args.force and not args.upload:
+        parser.error("--force only works with --upload")
+    if args.upload and args.tui:
+        parser.error("--upload and --tui can't be used together")
 
-    config = {}
+    if args.tui:
+        main_tui(args)
+        return
+
+    configure_logging(args.log_level, args.log_file, args.log_retention_days, args.log_format)
+    log.debug({"event_type": "debug_logging_enabled"})
+
+    config = load_config(args.config)
+    note_unused_settings(config)
+    uploader = Uploader(args.config, config)
+
+    if args.upload:
+        upload_now(uploader, args.upload, args.force)
+        return
 
     try:
-        log_level = getattr(logging, args.log_level.upper())
-    except AttributeError as e:
-        log_level = logging.INFO
+        uploader.run()
+    except KeyboardInterrupt:
+        log.info({"event_type": "quit"})
+    except Exception as e:
+        log.error({"event_type": "unexpected_error", "error": str(e)})
 
-    logging.basicConfig(
-        format='{"timestamp": "%(asctime)s.%(msecs)03d", "level": "%(levelname)s", "module", "%(module)s", "function_name": "%(funcName)s", "line_num", %(lineno)d, "message": %(message)s}',
-        datefmt='%Y-%m-%dT%H:%M:%S',
-        encoding='utf-8',
-        level=log_level,
-    )
-    logging.debug(json.dumps({"event_type": "debug_logging_enabled"}))
-    logging.getLogger("paramiko").setLevel(logging.ERROR)
 
-    quit_when_safe = False
-    scan_interval = DEFAULT_SCAN_INTERVAL_SECONDS
+def main_tui(args: argparse.Namespace):
+    try:
+        from nanopore_uploader.tui.app import UploaderApp, TUILogHandler
+    except ImportError as e:
+        print(f"The TUI needs the 'textual' package ({e}). Install it with: pip install 'nanopore-uploader[tui]'", file=sys.stderr)
+        sys.exit(1)
 
-    while(True):
-        try:
-            if args.config:
-                try:
-                    config = nanopore_uploader.config.load_config(args.config)
-                    logging.info(json.dumps({"event_type": "config_loaded", "config_file": os.path.abspath(args.config)}))
-                except json.decoder.JSONDecodeError as e:
-                    # If we fail to load the config file, we continue on with the
-                    # last valid config that was loaded.
-                    logging.error(json.dumps({"event_type": "load_config_failed", "config_file": os.path.abspath(args.config)}))
+    tui_handler = TUILogHandler()
+    configure_logging(args.log_level, args.log_file, args.log_retention_days, args.log_format, tui_handler=tui_handler)
 
-            scan_start_timestamp = datetime.datetime.now()
-            core.find_remote_runs(config)
-            for run in core.scan(config):
-                if run is not None:
-                    try:
-                        config = nanopore_uploader.config.load_config(args.config)
-                        logging.info(json.dumps({"event_type": "config_loaded", "config_file": os.path.abspath(args.config)}))
-                    except json.decoder.JSONDecodeError as e:
-                        logging.error(json.dumps({"event_type": "load_config_failed", "config_file": os.path.abspath(args.config)}))
-                    run['status'] = core.check_run_status(config, run)
-                    logging.debug(json.dumps({"event_type": "run_status_checked", "sequencing_run_id": run['sequencing_run_id'], "status": run['status']}))
-                    if run['status'] == 'QUEUED_FOR_UPLOAD':
-                        core.upload_run(config, run)
-                if quit_when_safe:
-                    exit(0)
-            scan_complete_timestamp = datetime.datetime.now()
-            scan_duration_delta = scan_complete_timestamp - scan_start_timestamp
-            scan_duration_seconds = scan_duration_delta.total_seconds()
-            logging.info(json.dumps({"event_type": "scan_complete", "scan_duration_seconds": scan_duration_seconds}))
+    config = load_config(args.config)
+    note_unused_settings(config)
+    app = UploaderApp(args.config, config, tui_handler, log_level=args.log_level)
+    app.run()
 
-            if quit_when_safe:
-                exit(0)
-
-            if "scan_interval_seconds" in config:
-                try:
-                    scan_interval = float(str(config['scan_interval_seconds']))
-                except ValueError as e:
-                    scan_interval = DEFAULT_SCAN_INTERVAL_SECONDS
-            time.sleep(scan_interval)
-        except KeyboardInterrupt as e:
-            logging.info(json.dumps({"event_type": "quit_when_safe_enabled"}))
-            quit_when_safe = True
 
 if __name__ == '__main__':
     main()

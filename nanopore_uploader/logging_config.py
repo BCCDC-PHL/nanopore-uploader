@@ -1,0 +1,178 @@
+from datetime import datetime
+import json
+import logging
+import logging.handlers
+import os
+import sys
+
+from typing import Optional
+
+class JSONFormatter(logging.Formatter):
+    """
+    Custom formatter for logging in structured JSON Lines.
+    """
+
+    def formatTime(self, record: logging.LogRecord, datefmt: Optional[str]=None) -> str:
+        """
+        Returns the creation time of the LogRecord formatted with milliseconds.
+        :param record: The logging record
+        :return: The log record creation time, formatted as an ISO timestamp
+        """
+        # Convert record.created timestamp into a local datetime object
+        dt = datetime.fromtimestamp(record.created)
+        # Format date and time down to seconds, then slice off microsecond precision to milliseconds
+        return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{int(record.msecs):03d}"
+
+    def _safe_serialize(self, obj):
+        """Recursively forces non-serializable objects into strings."""
+        try:
+            # default=str automatically converts datetimes, sets, and custom objects to strings
+            return json.dumps(obj, default=str)
+        except Exception:
+            # Absolute worst-case scenario fallback (e.g., recursive loops)
+            return json.dumps({
+                "timestamp": obj.get("timestamp"),
+                "level": obj.get("level"),
+                "module": obj.get("module"),
+                "function_name": obj.get("function_name"),
+                "line_num": obj.get("line_num"),
+                "message": {"event": "logging_error",
+                            "original_msg_repr": repr(obj.get("message"))}
+            })
+
+    def format(self, record: logging.LogRecord) -> str:
+        """
+        Format a log record as a JSON object, encoded as a string.
+        """
+        # Build the foundational structured log entry
+        log_entry = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "module": record.module,
+            "function_name": record.funcName,
+            "line_num": record.lineno,
+        }
+        if isinstance(record.msg, dict):
+            log_entry["message"] = record.msg
+        else:
+            # Fallback for standard string messages
+            log_entry["message"] = record.getMessage()
+
+        # Capture tracebacks automatically if an exception occurred
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+            
+        # Dynamically inject keys passed via the 'extra' keyword argument
+        # while ignoring standard built-in LogRecord attributes
+        builtins = {
+            "args",
+            "asctime",
+            "created",
+            "exc_info",
+            "exc_text",
+            "filename",
+            "funcName",
+            "levelname",
+            "levelno",
+            "lineno",
+            "module",
+            "msecs",
+            "msg",
+            "name",
+            "pathname",
+            "process",
+            "processName",
+            "relativeCreated",
+            "stack_info",
+            "thread",
+            "threadName",
+            "taskName",
+        }
+        for key, value in record.__dict__.items():
+            if key not in builtins:
+                log_entry[key] = value
+
+        try:
+            # First attempt: Try standard, fast serialization
+            return json.dumps(log_entry)
+        except TypeError:
+            # Second attempt: Graceful recovery if an object (like a set or datetime) fails
+            return self._safe_serialize(log_entry)
+
+class TextFormatter(logging.Formatter):
+    def formatTime(self, record: logging.LogRecord, datefmt: Optional[str]=None) -> str:
+            """
+            Returns the creation time of the LogRecord formatted with milliseconds.
+            :param record: The logging record
+            :return: The log record creation time, formatted as an ISO timestamp
+            """
+            # Convert record.created timestamp into a local datetime object
+            dt = datetime.fromtimestamp(record.created)
+            # Format date and time down to seconds, then slice off microsecond precision to milliseconds
+            return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{int(record.msecs):03d}"
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = record.getMessage()
+        timestamp = self.formatTime(record)
+        formatted = f"{timestamp} - {record.name} - {record.levelname} - {message}"
+        if record.exc_info:
+            formatted += "\n" + self.formatException(record.exc_info)
+        if record.stack_info:
+            formatted += "\n" + self.formatStack(record.stack_info)
+        return formatted
+
+
+def make_log_handler(log_file: Optional[os.PathLike]=None, log_retention_days: int=90) -> logging.Handler:
+    """
+    Make the handler that log records are written to.
+
+    If a log file is given, the log is appended to that file (so restarting doesn't overwrite it), and rotated at midnight.
+    Rotated logs are named with the date they cover (eg. 'qc-check.jsonl.2026-10-05').
+
+    :param log_file: Path to the log file. If None, log to stdout.
+    :param log_retention_days: Number of rotated log files to keep. Older ones are deleted. 0 keeps all of them.
+    :return: The log handler.
+    """
+    if log_file is None:
+        return logging.StreamHandler(sys.stdout)
+
+    return logging.handlers.TimedRotatingFileHandler(log_file, when='midnight', backupCount=log_retention_days, encoding='utf-8')
+
+
+def configure_logging(log_level: str="info", log_file: Optional[os.PathLike]=None, log_retention_days: int=90, log_format: str="json", tui_handler: Optional[logging.Handler]=None):
+    """
+    Configure logging
+
+    :param log_level: Log level ('debug', 'info', 'warning', 'error') default: 'info'
+    :param log_file: Path to the log file. If None, log to stdout (or only to the TUI, if there is one).
+    :param log_retention_days: Number of rotated log files to keep. 0 keeps all of them.
+    :param log_format: Format of the log output ('json' or 'text'). Default is 'json'.
+    :param tui_handler: In TUI mode, the handler that passes log records to the TUI.
+                        It receives debug records too (the TUI tracks run status from them) and decides what to show.
+    """
+    if log_format == "json":
+        formatter = JSONFormatter()
+    else:
+        formatter = TextFormatter()
+
+    if tui_handler is None:
+        handler = make_log_handler(log_file, log_retention_days)
+        handler.setFormatter(formatter)
+        logging.basicConfig(
+            level=log_level.upper(),
+            handlers=[handler]
+        )
+    else:
+        # Writing to stdout would corrupt the TUI's display, so only log to a file if one was given.
+        handlers = [tui_handler]
+        if log_file is not None:
+            file_handler = make_log_handler(log_file, log_retention_days)
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(log_level.upper())
+            handlers.append(file_handler)
+        logging.basicConfig(
+            level=logging.DEBUG,
+            handlers=handlers
+        )
+    # if log_level.lower() != "debug":
+    logging.getLogger("paramiko").setLevel(logging.ERROR)

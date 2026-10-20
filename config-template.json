@@ -2,7 +2,7 @@
     "sequencers": [
         {
             "instrument_id": "",
-            "run_output_dir": "",
+            "run_output_dir": "/data",
             "instrument_type": "gridion",
             "destination_servers": [
                 {
@@ -10,12 +10,28 @@
                     "server_address": "analysis.example.org",
                     "login_id": "user",
                     "id_file": "/home/user/.ssh/id_rsa",
+                    "permissions": {
+                        "Du": "rwx",
+                        "Dg": "rx",
+                        "Fu": "rw",
+                        "Fg": "r",
+                        "o": ""
+                    },
                     "destination_dir": "/data/sequence/gridion/runs"
                 }
             ]
         }
     ],
-    "scan_interval_seconds": 5,
-    "database_connection_uri": "sqlite:///nanopore_uploader.db",
-    "database_backups_dir": ""
+    "notification": {
+        "system_config_file": "/path/to/notification/config.json",
+        "recipient_email_addresses": [
+            "dan.fornika@bccdc.ca"
+        ],
+        "send_notification_emails": true
+    },
+    "scan_interval_seconds": 600,
+    "auto_upload": false,
+    "max_upload_attempts": 3,
+    "excluded_runs_list": "/path/to/excluded_runs.txt",
+    "upload_history_file": "/path/to/upload_history.csv"
 }
