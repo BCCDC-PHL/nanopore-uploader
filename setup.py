@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='nanopore-uploader',
-    version='0.1.0',
+    version='1.0.0',
     description='',
     author='Dan Fornika',
     author_email='dan.fornika@bccdc.ca',
@@ -14,9 +14,9 @@ setup(
         "paramiko~=2.11.0",
         "requests~=2.32",
         "jinja2~=3.1",
+        "textual>=8.2",
     ],
     extras_require={
-        "tui": ["textual>=8.2"],
         "test": ["pytest>=8", "textual>=8.2"],
     },
     setup_requires=[],
